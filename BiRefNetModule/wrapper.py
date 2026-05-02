@@ -54,8 +54,9 @@ base_folder = os.path.join(os.path.dirname(__file__), "checkpoints")
 
 
 class BiRefNetHandler:
-    def __init__(self, device="cpu", usage="General"):
+    def __init__(self, device="cpu", usage="General", soft_matte: bool = False):
         self.device = device
+        self.soft_matte = soft_matte
 
         # Set resolution
         if usage in ["General-Lite-2K"]:
@@ -80,7 +81,7 @@ class BiRefNetHandler:
             local_dir_use_symlinks=False,  # Ensures actual files are downloaded, not just symlinks to the cache
         )
 
-        self.birefnet = AutoModelForImageSegmentation.from_pretrained(model_local_dir, trust_remote_code=False)
+        self.birefnet = AutoModelForImageSegmentation.from_pretrained(model_local_dir, trust_remote_code=True)
 
         self.birefnet.to(device)
         self.birefnet.eval()
@@ -103,10 +104,17 @@ class BiRefNetHandler:
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
-    def process(self, input_path, alpha_output_dir=None, dilate_radius=0, on_frame_complete=None):
+    def process(self, input_path, alpha_output_dir=None, dilate_radius=0, on_frame_complete=None, soft_matte=None):
         """
         Process a single video or directory of images.
+
+        Args:
+            soft_matte: Override instance-level soft_matte setting. When True,
+                        preserves the raw sigmoid matte (soft alpha) instead of
+                        applying binary thresholding and dilation/erosion.
         """
+        if soft_matte is None:
+            soft_matte = self.soft_matte
         input_path = Path(input_path)
         file_name = input_path.stem
         is_video = input_path.suffix.lower() in [".mp4", ".mkv", ".gif", ".mov", ".avi"]
@@ -184,18 +192,24 @@ class BiRefNetHandler:
             mask = pred_pil.resize(target_size)
             mask_np = np.array(mask)
 
-            # Dilate
-            if dilate_radius != 0:
-                abs_radius = abs(dilate_radius)
-                k_size = abs_radius * 2 + 1
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-                if dilate_radius > 0:
-                    mask_np = cv2.dilate(mask_np, kernel, iterations=1)  # Expansion
-                else:
-                    mask_np = cv2.erode(mask_np, kernel, iterations=1)  # Contraction
+            if soft_matte:
+                # Preserve the full soft sigmoid matte — no binary threshold,
+                # no dilation/erosion. This gives downstream inference engines
+                # proper fractional alpha values for edge despill.
+                pass
+            else:
+                # Dilate
+                if dilate_radius != 0:
+                    abs_radius = abs(dilate_radius)
+                    k_size = abs_radius * 2 + 1
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+                    if dilate_radius > 0:
+                        mask_np = cv2.dilate(mask_np, kernel, iterations=1)  # Expansion
+                    else:
+                        mask_np = cv2.erode(mask_np, kernel, iterations=1)  # Contraction
 
-            # Strict Binary Threshold
-            _, mask_np = cv2.threshold(mask_np, 10, 255, cv2.THRESH_BINARY)
+                # Strict Binary Threshold
+                _, mask_np = cv2.threshold(mask_np, 10, 255, cv2.THRESH_BINARY)
 
             # Save
             if alpha_output_dir:
