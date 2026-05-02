@@ -560,15 +560,27 @@ class CorridorKeyService:
             matte_path = os.path.join(dirs["matte"], f"{input_stem}.{cfg.matte_format}")
             self._write_image(alpha, matte_path, cfg.matte_format, clip_name, frame_index)
 
-        # Comp
+        # Comp (RGBA with alpha channel embedded — BGRA for OpenCV)
         if cfg.comp_enabled:
             comp_srgb = res["comp"]
-            comp_bgr = cv2.cvtColor(
-                (np.clip(comp_srgb, 0.0, 1.0) * 255.0).astype(np.uint8),
-                cv2.COLOR_RGB2BGR,
-            )
+            comp_rgb_u8 = (np.clip(comp_srgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+            comp_bgr = cv2.cvtColor(comp_rgb_u8, cv2.COLOR_RGB2BGR)
+
+            # Embed the predicted alpha as the 4th channel
+            alpha = pred_alpha
+            if alpha.ndim == 2:
+                pass  # already single-channel
+            elif alpha.ndim == 3:
+                if alpha.shape[2] == 1:
+                    alpha = alpha[:, :, 0]
+                elif alpha.shape[2] >= 3:
+                    # Use the first channel (or luminance if needed)
+                    alpha = alpha[:, :, 0]
+            alpha_u8 = (np.clip(alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+            comp_bgra = cv2.merge((comp_bgr[:, :, 0], comp_bgr[:, :, 1], comp_bgr[:, :, 2], alpha_u8))
             comp_path = os.path.join(dirs["comp"], f"{input_stem}.{cfg.comp_format}")
-            self._write_image(comp_bgr, comp_path, cfg.comp_format, clip_name, frame_index)
+            self._write_image(comp_bgra, comp_path, cfg.comp_format, clip_name, frame_index)
 
         # Processed (RGBA premultiplied)
         if cfg.processed_enabled and "processed" in res:

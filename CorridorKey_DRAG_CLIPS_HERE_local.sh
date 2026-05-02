@@ -29,6 +29,10 @@ if ! command -v uv &> /dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
 
+# Set PyTorch CUDA memory allocation strategy to avoid fragmentation
+# This helps on 8GB and similar VRAM-constrained cards
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 echo "Starting Corridor Key locally..."
 echo "Target: $TARGET_PATH"
 

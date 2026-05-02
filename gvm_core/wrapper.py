@@ -103,6 +103,65 @@ class GVMProcessor:
         self.pipe = self.pipe.to(self.device, dtype=torch.float16)
         logging.info("Models loaded.")
 
+    @staticmethod
+    def _get_optimal_processing_resolution(orig_h, orig_w):
+        """
+        Determine optimal processing height based on available GPU VRAM.
+        Returns (target_height, max_size) tuple.
+        
+        Higher resolution = better quality but more VRAM.
+        1024p -> ~12GB+ recommended
+        768p  -> ~8-10GB
+        512p  -> ~4-6GB
+        """
+        if not torch.cuda.is_available():
+            return (512, 512)  # CPU-friendly fallback
+        
+        # Get available VRAM in GiB
+        try:
+            vram_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        except Exception:
+            vram_gib = 8.0  # Conservative fallback
+        
+        if vram_gib >= 14.0:
+            target_h = 1024
+            scale_cap = 1920
+        elif vram_gib >= 10.0:
+            target_h = 768
+            scale_cap = 1536
+        elif vram_gib >= 6.0:
+            target_h = 576
+            scale_cap = 1280
+        else:
+            target_h = 512
+            scale_cap = 1024
+        
+        # Don't upscale if original is smaller
+        if orig_h < target_h:
+            target_h = orig_h
+            if orig_h < orig_w:
+                scale_cap = int(orig_w * (target_h / orig_h))
+            else:
+                scale_cap = target_h
+        
+        # Calculate max resolution / long edge
+        if orig_h < orig_w:  # Landscape
+            ratio = orig_w / orig_h
+            new_long = int(target_h * ratio)
+        else:
+            ratio = orig_h / orig_w
+            new_long = int(target_h * ratio)
+        
+        if new_long > scale_cap:
+            new_long = scale_cap
+        
+        logging.info(
+            f"Detected {vram_gib:.1f} GiB VRAM -> processing at {target_h}p "
+            f"(max dimension {new_long}px)"
+        )
+        
+        return target_h, new_long
+
     def process_sequence(self, input_path, output_dir, 
                          num_frames_per_batch=8,
                          denoise_steps=1,
@@ -149,28 +208,11 @@ class GVMProcessor:
             else:
                 orig_h, orig_w = 1080, 1920 # Fallback
 
-        target_h = orig_h
-        if target_h < 1024:
-            scale_ratio = 1024 / target_h
-            target_h = 1024
-        
-        # Calculate max resolution / long edge
-        if orig_h < orig_w: # Landscape
-            ratio = orig_w / orig_h
-            new_long = int(1024 * ratio)
-        else:
-            ratio = orig_h / orig_w
-            new_long = int(1024 * ratio)
-            
-        scale_cap = 1920
-        if new_long > scale_cap:
-            new_long = scale_cap
-        
-        max_res_param = new_long 
+        target_h, max_res_param = self._get_optimal_processing_resolution(orig_h, orig_w)
 
         transform = Compose([
             ToTensor(),
-            Resize(size=1024, max_size=max_res_param, antialias=True)
+            Resize(size=target_h, max_size=max_res_param, antialias=True)
         ])
 
         if is_video:
@@ -239,6 +281,16 @@ class GVMProcessor:
             # Pad (Reflective)
             batch, pad_info = impad_multi(batch)
 
+            # Adaptive decode_chunk_size for low-VRAM cards
+            # The VAE decoder is the memory bottleneck; smaller chunks = less peak VRAM
+            vram_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3) if self.device.type == "cuda" else 0
+            if vram_gib <= 8.0:
+                effective_decode_chunk = 1
+            elif vram_gib <= 12.0:
+                effective_decode_chunk = 2
+            else:
+                effective_decode_chunk = decode_chunk_size
+
             # Inference
             with torch.no_grad():
                 pipe_out = self.pipe(
@@ -246,8 +298,9 @@ class GVMProcessor:
                     num_frames=num_frames_per_batch,
                     num_overlap_frames=num_overlap_frames,
                     num_interp_frames=num_interp_frames,
-                    decode_chunk_size=decode_chunk_size,
+                    decode_chunk_size=effective_decode_chunk,
                     num_inference_steps=denoise_steps,
+                    encode_chunk_size=1,
                     mode=mode,
                     use_clip_img_emb=use_clip_img_emb,
                     noise_type=noise_type,
@@ -255,6 +308,10 @@ class GVMProcessor:
                 )
             image = pipe_out.image
             alpha = pipe_out.alpha
+
+            # Clear CUDA cache between batches to prevent fragmentation buildup
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
             # Crop padding
             out_h, out_w = image.shape[2:]

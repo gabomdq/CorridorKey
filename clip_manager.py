@@ -934,12 +934,16 @@ def run_inference(
             # Matte is single channel linear float
             cv2.imwrite(os.path.join(matte_dir, f"{input_stem}.exr"), pred_alpha, EXR_WRITE_FLAGS)
 
-            # 5. Generate Reference Comp
+            # 5. Generate Reference Comp (RGBA PNG with embedded alpha)
             if res["comp"] is not None:
                 comp_srgb = res["comp"]
-                # Save Comp (PNG 8-bit)
-                comp_bgr = cv2.cvtColor((np.clip(comp_srgb, 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
-                cv2.imwrite(os.path.join(comp_dir, f"{input_stem}.png"), comp_bgr)
+                comp_rgb_u8 = (np.clip(comp_srgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+                comp_bgr = cv2.cvtColor(comp_rgb_u8, cv2.COLOR_RGB2BGR)
+
+                # Merge the predicted alpha as the 4th channel -> BGRA
+                alpha_u8 = (np.clip(pred_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+                comp_bgra = cv2.merge((comp_bgr[:, :, 0], comp_bgr[:, :, 1], comp_bgr[:, :, 2], alpha_u8))
+                cv2.imwrite(os.path.join(comp_dir, f"{input_stem}.png"), comp_bgra)
 
             # 6. Save Processed (RGBA EXR)
             if "processed" in res:

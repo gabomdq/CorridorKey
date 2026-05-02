@@ -359,6 +359,7 @@ dependencies = [
     { name = "peft" },
     { name = "pillow" },
     { name = "pims" },
+    { name = "pytorch-rocm-gtt" },
     { name = "rich" },
     { name = "safetensors" },
     { name = "setuptools" },
@@ -418,6 +419,7 @@ requires-dist = [
     { name = "peft" },
     { name = "pillow" },
     { name = "pims" },
+    { name = "pytorch-rocm-gtt", specifier = ">=0.1.4" },
     { name = "pytorch-triton-rocm", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'rocm'", specifier = "==3.4.0", index = "https://download.pytorch.org/whl/rocm6.3", conflict = { package = "corridorkey", extra = "rocm" } },
     { name = "rich", specifier = ">=13" },
     { name = "safetensors" },
@@ -1740,6 +1742,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/82/ed/0301aeeac3e5353ef3d94b6ec08bbcabd04a72018415dcb29e588514bba8/python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3", size = 50135, upload-time = "2026-03-01T16:00:26.196Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
+]
+
+[[package]]
+name = "pytorch-rocm-gtt"
+version = "0.1.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/df/73/6cf0cb6f36bfb1851d257d381f44a3425914cc652e2855875e462e464ae3/pytorch_rocm_gtt-0.1.4.tar.gz", hash = "sha256:200ee6c4b83e8729a4bb21c968c8aed5e8641ff70e8ce6d97691f71db0597480", size = 4031, upload-time = "2024-04-02T01:32:51.135Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8c/48/029f6db6c202d42e130d85e5ccc7d6be77cc413b39af589c473f82dc1457/pytorch_rocm_gtt-0.1.4-py3-none-any.whl", hash = "sha256:d2740b52eac57b15b76a89136294d1c7842c12b4756124c69244f81a65719f41", size = 5112, upload-time = "2024-04-02T01:32:47.805Z" },
 ]
 
 [[package]]

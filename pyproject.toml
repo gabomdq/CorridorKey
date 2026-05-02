@@ -41,6 +41,7 @@ dependencies = [
     # CLI framework + terminal output
     "typer>=0.12",
     "rich>=13",
+    "pytorch-rocm-gtt>=0.1.4",
 ]
 
 [project.optional-dependencies]
