@@ -190,24 +190,30 @@ def _run_engine(
 # Re-runs with the same input but different output options (cut range, scale,
 # crop, framerate, codec settings) shouldn't re-run BiRefNet/VideoMaMa or the
 # CorridorKey engine.  We cache two artifacts per frame, both indexed by the
-# global frame index:
-#   <cache_root>/alphahint_<method>/NNNNNN.png  — uint8 grayscale alpha hint
-#   <cache_root>/keyed/NNNNNN.png               — RGBA-with-alpha keyed frame
+# global frame index, in a single shared cache folder so multiple inputs can
+# coexist without separate top-level dirs:
+#   <cache_root>/alphahint_<method>/<input_stem>_NNNNNN.png  uint8 alpha hint
+#   <cache_root>/keyed/<input_stem>_NNNNNN.png              RGBA keyed frame
 #
 # When all keyed frames in the requested range are present, we skip model
 # loading entirely and just re-encode.  When only the alpha hints are cached,
 # we skip the alpha-generation pass.  When nothing is cached, we run the
 # full pipeline and populate both layers.
 
-FRAME_FMT = "{:06d}.png"
+FRAME_INDEX_FMT = "{:06d}"
 
 
-def _resolve_cache_root(input_path: Path, args: argparse.Namespace) -> Path | None:
-    """Return the cache root for this input, or None when caching is off."""
+def _resolve_cache_root(args: argparse.Namespace) -> Path | None:
+    """Return the shared cache root, or None when caching is off.
+
+    The same root is used by every input run from this working dir; the
+    input stem is encoded in each cache file's name (see ``_frame_filename``)
+    so multiple inputs share the folder safely.
+    """
     if args.no_cache:
         return None
     base = Path(args.cache_dir) if args.cache_dir else Path.cwd()
-    return base / f"{input_path.stem}_corridorkey_cache"
+    return base / "corridorkey_cache"
 
 
 def _alphahint_cache_dir(cache_root: Path | None, method: str) -> Path | None:
@@ -218,14 +224,43 @@ def _keyed_cache_dir(cache_root: Path | None) -> Path | None:
     return None if cache_root is None else cache_root / "keyed"
 
 
-def _frame_path(cache_dir: Path | None, idx: int) -> Path | None:
-    return None if cache_dir is None else cache_dir / FRAME_FMT.format(idx)
+def _frame_filename(input_stem: str, idx: int) -> str:
+    """Cache-file name for one frame of one input.
+
+    Format: ``<input_stem>_<6-digit-index>.png``.  The stem disambiguates
+    files from different inputs sharing the same cache folder.
+    """
+    return f"{input_stem}_{FRAME_INDEX_FMT.format(idx)}.png"
 
 
-def _all_present(cache_dir: Path | None, start: int, end: int) -> bool:
+def _frame_path(cache_dir: Path | None, input_stem: str, idx: int) -> Path | None:
+    return None if cache_dir is None else cache_dir / _frame_filename(input_stem, idx)
+
+
+def _all_present(cache_dir: Path | None, input_stem: str, start: int, end: int) -> bool:
+    """True when every frame in ``[start, end)`` for ``input_stem`` is cached."""
     if cache_dir is None or not cache_dir.is_dir():
         return False
-    return all((cache_dir / FRAME_FMT.format(i)).is_file() for i in range(start, end))
+    return all(
+        (cache_dir / _frame_filename(input_stem, i)).is_file()
+        for i in range(start, end)
+    )
+
+
+def _clear_input_files(cache_root: Path | None, input_stem: str) -> int:
+    """Remove every cached file belonging to ``input_stem`` from every
+    subdir of ``cache_root``.  Other inputs' caches stay intact.
+    Returns the count of files removed.
+    """
+    if cache_root is None or not cache_root.is_dir():
+        return 0
+    count = 0
+    for sub in cache_root.iterdir():
+        if sub.is_dir():
+            for f in sub.glob(f"{input_stem}_*.png"):
+                f.unlink()
+                count += 1
+    return count
 
 
 def _read_cached_keyed(path: Path) -> np.ndarray:
@@ -256,15 +291,21 @@ def _write_cached_alphahint(path: Path, alpha_f32: np.ndarray) -> None:
 
 # --- VideoMaMa (GVM) ----------------------------------------------------------
 
-def _generate_videomama_masks(input_path: Path, output_dir: Path, device: str) -> list[Path]:
+def _generate_videomama_masks(
+    input_path: Path, output_dir: Path, input_stem: str, device: str,
+) -> list[Path]:
     """Run GVM (VideoMaMa) on ``input_path`` and write per-frame mask PNGs into
-    ``output_dir``.  Returns the sorted list of generated mask files.
+    ``output_dir`` using ``<input_stem>_NNNNNN.png`` names so the shared cache
+    folder can hold output for multiple inputs.
 
     Mirrors the parameters used by ``clip_manager.generate_alphas`` — single-
     frame batches and a 1-step denoise so the diffusion stays fast and the
     output is per-frame deterministic enough for downstream chroma keying.
     Drops the GVM model from VRAM before returning so the inference engine
     can be loaded next.
+
+    GVM writes its own ``0001.png`` counter scheme; we capture into a tempdir
+    and then move/rename into the shared cache with the stem-prefixed names.
     """
     from clip_manager import get_gvm_processor
 
@@ -272,26 +313,35 @@ def _generate_videomama_masks(input_path: Path, output_dir: Path, device: str) -
     processor = get_gvm_processor(device=device)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    log.info("Generating per-frame alpha masks via VideoMaMa ...")
-    processor.process_sequence(
-        input_path=str(input_path),
-        output_dir=None,
-        num_frames_per_batch=1,
-        decode_chunk_size=1,
-        denoise_steps=1,
-        mode="matte",
-        write_video=False,
-        direct_output_dir=str(output_dir),
-    )
 
-    del processor
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    with tempfile.TemporaryDirectory(prefix="gvm_raw_") as gvm_raw:
+        log.info("Generating per-frame alpha masks via VideoMaMa ...")
+        processor.process_sequence(
+            input_path=str(input_path),
+            output_dir=None,
+            num_frames_per_batch=1,
+            decode_chunk_size=1,
+            denoise_steps=1,
+            mode="matte",
+            write_video=False,
+            direct_output_dir=gvm_raw,
+        )
+        del processor
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    mask_files = sorted(p for p in output_dir.iterdir() if p.suffix.lower() == ".png")
-    log.info("VideoMaMa wrote %d mask PNGs", len(mask_files))
-    return mask_files
+        gvm_outputs = sorted(p for p in Path(gvm_raw).iterdir() if p.suffix.lower() == ".png")
+        log.info("Renaming %d GVM masks → %s/", len(gvm_outputs), output_dir)
+        renamed: list[Path] = []
+        for i, src in enumerate(gvm_outputs):
+            dst = output_dir / _frame_filename(input_stem, i)
+            # GVM's tempdir is on /tmp (or wherever); cache is in cwd.
+            # shutil.move handles cross-filesystem cases; falls back to copy+unlink.
+            import shutil
+            shutil.move(str(src), str(dst))
+            renamed.append(dst)
+    return renamed
 
 
 # --- ffmpeg sink (video output) ---------------------------------------------
@@ -383,6 +433,7 @@ def run_image(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
 
 def _encode_from_keyed_cache(
     keyed_dir: Path,
+    input_stem: str,
     *,
     start: int, n_frames: int,
     width: int, height: int, framerate: float,
@@ -399,7 +450,7 @@ def _encode_from_keyed_cache(
     try:
         for i in range(n_frames):
             global_idx = start + i
-            rgba_u8 = _read_cached_keyed(keyed_dir / FRAME_FMT.format(global_idx))
+            rgba_u8 = _read_cached_keyed(keyed_dir / _frame_filename(input_stem, global_idx))
             proc.stdin.write(rgba_u8.tobytes())
             now = time.monotonic()
             if now - last_log >= 5.0:
@@ -438,21 +489,23 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
         sys.exit("--start-frame / --end-frame leaves no frames to process.")
     n_frames = end - start
 
-    cache_root = _resolve_cache_root(input_path, args)
+    input_stem = input_path.stem
+    cache_root = _resolve_cache_root(args)
     alpha_dir = _alphahint_cache_dir(cache_root, args.alpha_method)
     keyed_dir = _keyed_cache_dir(cache_root)
     if cache_root is not None:
-        log.info("Cache root: %s", cache_root)
+        log.info("Cache root: %s (this input → %s_NNNNNN.png)", cache_root, input_stem)
     log.info(
         "Video: %dx%d @ %.3f fps, %d frames total, processing %d (%d..%d), method=%s",
         width, height, fps, n_total, n_frames, start, end - 1, args.alpha_method,
     )
 
     # Fast path: every requested frame is already keyed on disk → encode only.
-    if _all_present(keyed_dir, start, end):
+    if _all_present(keyed_dir, input_stem, start, end):
         log.info("All %d keyed frames cached; skipping models, encode-only.", n_frames)
         _encode_from_keyed_cache(
             keyed_dir,  # type: ignore[arg-type]  # _all_present guarantees not None
+            input_stem,
             start=start, n_frames=n_frames,
             width=width, height=height, framerate=framerate,
             output_path=output_path, args=args,
@@ -462,21 +515,28 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
 
     # Some keyed frames missing → we need the inference engine (and possibly
     # the alpha generator).  For VideoMaMa, masks are batch-generated for the
-    # whole video; if ANY mask is missing we regenerate them all.  For
+    # whole video; if ANY mask is missing we regenerate them all (this input's
+    # files only — other inputs in the shared cache are left intact).  For
     # BiRefNet, alpha generation is per-frame so partial caches are fine.
     if args.alpha_method == "videomama":
-        if alpha_dir is not None and not _all_present(alpha_dir, 0, n_total):
+        if alpha_dir is not None and not _all_present(alpha_dir, input_stem, 0, n_total):
             if alpha_dir.is_dir():
-                # Partial videomama output is unsafe — clear and regenerate.
-                import shutil
-                log.info("VideoMaMa cache incomplete; clearing %s", alpha_dir)
-                shutil.rmtree(alpha_dir)
-            _generate_videomama_masks(input_path, alpha_dir, args.device)
+                # Partial videomama output is unsafe — clear THIS input's masks
+                # and regenerate.  Other inputs sharing the dir are untouched.
+                stale = list(alpha_dir.glob(f"{input_stem}_*.png"))
+                if stale:
+                    log.info(
+                        "VideoMaMa cache for %r incomplete; clearing %d stale files",
+                        input_stem, len(stale),
+                    )
+                    for f in stale:
+                        f.unlink()
+            _generate_videomama_masks(input_path, alpha_dir, input_stem, args.device)
         elif alpha_dir is None:
             # Caching disabled: write masks to a tempdir for this run only.
             tmp_holder = tempfile.TemporaryDirectory(prefix="corridorkey_alpha_")
             alpha_dir = Path(tmp_holder.name)
-            _generate_videomama_masks(input_path, alpha_dir, args.device)
+            _generate_videomama_masks(input_path, alpha_dir, input_stem, args.device)
             args._tmp_alpha_holder = tmp_holder  # keep alive until end of run
 
     # BiRefNet handler is created lazily on the first uncached alpha hint.
@@ -484,13 +544,13 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
 
     def alpha_provider(idx: int, frame_rgb: np.ndarray) -> np.ndarray:
         nonlocal handler
-        cached = _frame_path(alpha_dir, idx)
+        cached = _frame_path(alpha_dir, input_stem, idx)
         if cached and cached.is_file():
             return _read_cached_alphahint(cached)
         if args.alpha_method == "videomama":
             raise RuntimeError(
-                f"VideoMaMa mask missing for frame {idx} after generation pass — "
-                f"check cache dir {alpha_dir}"
+                f"VideoMaMa mask missing for frame {idx} of {input_stem!r} after "
+                f"generation pass — check cache dir {alpha_dir}"
             )
         if handler is None:
             handler = _create_birefnet(args.device, args.birefnet_usage)
@@ -519,7 +579,7 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
         last_log = t0
         for i in range(n_frames):
             global_idx = start + i
-            keyed_path = _frame_path(keyed_dir, global_idx)
+            keyed_path = _frame_path(keyed_dir, input_stem, global_idx)
 
             ret, frame_bgr = cap.read()  # always advance to keep cap in sync
             if not ret:
@@ -648,16 +708,19 @@ def main() -> None:
 
     cache = parser.add_argument_group("cache (video only)")
     cache.add_argument("--cache-dir", default=None,
-                       help="Parent dir for the per-input cache (default: cwd). "
-                            "The script creates <root>/<input_stem>_corridorkey_cache/ "
-                            "with alphahint_<method>/ and keyed/ subdirs.")
+                       help="Parent dir for the shared cache (default: cwd). "
+                            "Layout: <root>/corridorkey_cache/{alphahint_<method>,keyed}/"
+                            "<input_stem>_NNNNNN.png — multiple inputs share one folder; "
+                            "the input stem in each filename keeps them separated.")
     cache.add_argument("--no-cache", action="store_true",
                        help="Disable on-disk caching of alpha hints + keyed RGBA frames. "
                             "Every run does the full pipeline.")
     cache.add_argument("--clean", action="store_true",
-                       help="Delete the cache for this input before running. Use this when "
-                            "you change inference params (despill, refiner, image-size, "
-                            "screen-color) and want stale keyed frames regenerated.")
+                       help="Delete THIS input's cached files (matched by stem prefix) "
+                            "before running. Other inputs in the shared cache are left "
+                            "intact. Use this when you change inference params (despill, "
+                            "refiner, image-size, screen-color) and want stale keyed "
+                            "frames regenerated.")
 
     args = parser.parse_args()
 
@@ -685,15 +748,16 @@ def main() -> None:
 
     log.info("Routing: %s → %s (%s)", input_path, output_path, "video" if is_video else "image")
 
-    # --clean: nuke the cache before running (video only — image path doesn't cache).
+    # --clean: remove THIS input's cached files from the shared cache before
+    # running (video only — image path doesn't cache).  Other inputs' caches
+    # are left intact, since they share the same alphahint_*/ and keyed/ dirs.
     if args.clean and is_video:
-        cache_root = _resolve_cache_root(input_path, args)
-        if cache_root is not None and cache_root.exists():
-            import shutil
-            log.info("--clean: removing cache %s", cache_root)
-            shutil.rmtree(cache_root)
-        elif cache_root is None:
+        cache_root = _resolve_cache_root(args)
+        if cache_root is None:
             log.info("--clean: no cache to remove (--no-cache is set)")
+        else:
+            removed = _clear_input_files(cache_root, input_path.stem)
+            log.info("--clean: removed %d cached files for %r", removed, input_path.stem)
 
     if is_video:
         run_video(input_path, output_path, args)
