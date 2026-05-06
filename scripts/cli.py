@@ -261,19 +261,66 @@ def _all_present(cache_dir: Path | None, input_stem: str, start: int, end: int) 
     )
 
 
-def _clear_input_files(cache_root: Path | None, input_stem: str) -> int:
-    """Remove every cached file belonging to ``input_stem`` from every
-    subdir of ``cache_root``.  Other inputs' caches stay intact.
+CACHE_LAYER_DIRS: dict[str, str] = {
+    "birefnet":  "alphahint_birefnet",
+    "gvm":       "alphahint_gvm",
+    "videomama": "alphahint_videomama",
+    "inference": "keyed",
+}
+CACHE_LAYER_ALIASES: dict[str, str] = {"mama": "videomama"}
+ALPHA_LAYERS: tuple[str, ...] = ("birefnet", "gvm", "videomama")
+
+
+def _normalize_clean_layers(layers: list[str] | None) -> list[str]:
+    """Map user-supplied --clean layer names (with aliases) to canonical names.
+
+    None or empty list → all known layers.  Cleaning any alpha layer
+    implicitly also cleans 'inference', since keyed frames are derived
+    from the alpha hints.
+    """
+    if not layers:
+        return list(CACHE_LAYER_DIRS.keys())
+    canon: list[str] = []
+    for raw in layers:
+        canon.append(CACHE_LAYER_ALIASES.get(raw, raw))
+    if any(l in ALPHA_LAYERS for l in canon) and "inference" not in canon:
+        canon.append("inference")
+    # Preserve order, dedupe.
+    seen: set[str] = set()
+    out: list[str] = []
+    for l in canon:
+        if l not in seen:
+            seen.add(l)
+            out.append(l)
+    return out
+
+
+def _clear_input_files(
+    cache_root: Path | None,
+    input_stem: str,
+    layers: list[str] | None = None,
+) -> int:
+    """Remove cached files belonging to ``input_stem`` from selected layers.
+
+    ``layers`` is a list of canonical layer names ('birefnet', 'gvm',
+    'videomama', 'inference').  ``None`` or an empty list means "all
+    layers".  Other inputs sharing the cache root are never touched.
     Returns the count of files removed.
     """
     if cache_root is None or not cache_root.is_dir():
         return 0
+    layers = layers or list(CACHE_LAYER_DIRS.keys())
     count = 0
-    for sub in cache_root.iterdir():
-        if sub.is_dir():
-            for f in sub.glob(f"{input_stem}_*.png"):
-                f.unlink()
-                count += 1
+    for layer in layers:
+        sub_name = CACHE_LAYER_DIRS.get(layer)
+        if sub_name is None:
+            continue
+        sub = cache_root / sub_name
+        if not sub.is_dir():
+            continue
+        for f in sub.glob(f"{input_stem}_*.png"):
+            f.unlink()
+            count += 1
     return count
 
 
@@ -747,10 +794,11 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
     if _all_present(keyed_dir, input_stem, start, end):
         log.info(
             "FAST PATH: all %d keyed frames cached for %r — skipping alpha + "
-            "inference, encode-only. Pass --clean to invalidate this cache "
-            "and re-run inference (necessary when --despill-strength, "
-            "--refiner-scale, --image-size, --screen-color, or "
-            "--gpu-post-processing change).",
+            "inference, encode-only. Pass --clean inference to re-run "
+            "inference with the existing alpha hints (e.g. after changing "
+            "--despill-strength, --refiner-scale, --image-size, "
+            "--screen-color, or --gpu-post-processing); --clean alone "
+            "wipes alpha hints too.",
             n_frames, input_stem,
         )
         _encode_from_keyed_cache(
@@ -1120,12 +1168,20 @@ def main() -> None:
     cache.add_argument("--no-cache", action="store_true",
                        help="Disable on-disk caching of alpha hints + keyed RGBA frames. "
                             "Every run does the full pipeline.")
-    cache.add_argument("--clean", action="store_true",
-                       help="Delete THIS input's cached files (matched by stem prefix) "
-                            "before running. Other inputs in the shared cache are left "
-                            "intact. Use this when you change inference params (despill, "
-                            "refiner, image-size, screen-color) and want stale keyed "
-                            "frames regenerated.")
+    cache.add_argument("--clean", nargs="*", default=None, metavar="LAYER",
+                       choices=("birefnet", "gvm", "videomama", "mama", "inference"),
+                       help="Selectively clean THIS input's cached files (matched by "
+                            "stem prefix) before running.\n"
+                            "  --clean                 — clean every layer (alpha hints "
+                            "+ keyed frames).\n"
+                            "  --clean inference       — only the post-inference keyed "
+                            "frames; the alpha hints stay so inference reuses them.\n"
+                            "  --clean birefnet|gvm|videomama (alias 'mama')\n"
+                            "                          — clean that alpha-hint layer; "
+                            "the keyed frames are also cleaned automatically since they "
+                            "depend on those hints.\n"
+                            "  --clean a b c           — multiple layers in one go.\n"
+                            "Other inputs sharing the cache root are never touched.")
 
     args = parser.parse_args()
 
@@ -1162,14 +1218,20 @@ def main() -> None:
     log.info("Routing: %s → %s (%s)", input_path, output_path, "video" if is_video else "image")
 
     # --clean: remove THIS input's cached files from the shared cache before
-    # running (video only — image path doesn't cache).  Other inputs' caches
-    # are left intact, since they share the same alphahint_*/ and keyed/ dirs.
-    if args.clean and is_video:
+    # running (video only — image path doesn't cache).  args.clean is None
+    # when the flag wasn't passed, [] for bare --clean (= clean all), or a
+    # list of layer names.  Other inputs' caches are left intact.
+    if args.clean is not None and is_video:
         cache_root = _resolve_cache_root(args)
         if cache_root is None:
             log.info("--clean: no cache to remove (--no-cache is set)")
         else:
-            removed = _clear_input_files(cache_root, input_path.stem)
+            layers = _normalize_clean_layers(args.clean)
+            log.info(
+                "--clean: layers to remove for %r: %s",
+                input_path.stem, ", ".join(layers),
+            )
+            removed = _clear_input_files(cache_root, input_path.stem, layers)
             log.info("--clean: removed %d cached files for %r", removed, input_path.stem)
 
     if is_video:
