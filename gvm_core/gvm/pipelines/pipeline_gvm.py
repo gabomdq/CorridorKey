@@ -64,38 +64,68 @@ class GVMPipeline(DiffusionPipeline, GVMLoraLoader):
             vae=vae, unet=unet, scheduler=scheduler
         )
 
-    def encode(self, input):
+    def encode(self, input, encode_chunk_size=8):
         num_frames = input.shape[1]
         input = input.flatten(0, 1)
-        latent = self.vae.encode(input.to(self.vae.dtype)).latent_dist.mode()
+        
+        # Encode in chunks to avoid OOM during VAE encoding
+        latents = []
+        for i in range(0, input.shape[0], encode_chunk_size):
+            chunk = input[i : i + encode_chunk_size].to(self.vae.dtype)
+            latent = self.vae.encode(chunk).latent_dist.mode()
+            latents.append(latent)
+            # Free intermediate tensors immediately
+            del chunk
+        latent = torch.cat(latents, dim=0)
+        del latents
+        
         latent = latent * self.vae.config.scaling_factor
         latent = latent.reshape(-1, num_frames, *latent.shape[1:])
         return latent
 
-    def decode(self, latents, decode_chunk_size=16):
-        # [batch, frames, channels, height, width] -> [batch*frames, channels, height, width]
-        num_frames = latents.shape[1]
-        latents = latents.flatten(0, 1)
-        latents = latents / self.vae.config.scaling_factor
+    def decode(self, latents, decode_chunk_size=4):
+        # Offload UNet to CPU during VAE decode to free VRAM
+        # Both models don't need to be on GPU simultaneously
+        unet_device = next(self.unet.parameters()).device
+        vae_device = next(self.vae.parameters()).device
+        if vae_device.type == "cuda" and unet_device.type == "cuda":
+            self.unet.to("cpu")
+            torch.cuda.empty_cache()
 
-        # decode decode_chunk_size frames at a time to avoid OOM
-        frames = []
-        for i in range(0, latents.shape[0], decode_chunk_size):
-            num_frames_in = latents[i : i + decode_chunk_size].shape[0]
-            frame = self.vae.decode(
-                latents[i : i + decode_chunk_size].to(self.vae.dtype),
-                num_frames=num_frames_in,
-            ).sample
-            frames.append(frame)
-        frames = torch.cat(frames, dim=0)
+        try:
+            # [batch, frames, channels, height, width] -> [batch*frames, channels, height, width]
+            num_frames = latents.shape[1]
+            latents = latents.flatten(0, 1)
+            latents = latents / self.vae.config.scaling_factor
 
-        # [batch, frames, channels, height, width]
-        frames = frames.reshape(-1, num_frames, *frames.shape[1:])
-        return frames.to(torch.float32)
+            # decode decode_chunk_size frames at a time to avoid OOM
+            frames = []
+            for i in range(0, latents.shape[0], decode_chunk_size):
+                num_frames_in = latents[i : i + decode_chunk_size].shape[0]
+                chunk = latents[i : i + decode_chunk_size].to(self.vae.dtype)
+                frame = self.vae.decode(
+                    chunk,
+                    num_frames=num_frames_in,
+                ).sample
+                frames.append(frame)
+                # Free intermediate tensors immediately
+                del chunk
+                if latents.device.type == "cuda":
+                    torch.cuda.empty_cache()
+            frames = torch.cat(frames, dim=0)
+            del latents
+
+            # [batch, frames, channels, height, width]
+            frames = frames.reshape(-1, num_frames, *frames.shape[1:])
+            return frames.to(torch.float32)
+        finally:
+            # Restore UNet to its original device
+            if unet_device.type == "cuda":
+                self.unet.to(unet_device)
 
     
-    def single_infer(self, rgb, position_ids=None, num_inference_steps=None, class_labels=None, noise_type="gaussian"):
-        rgb_latent = self.encode(rgb)
+    def single_infer(self, rgb, position_ids=None, num_inference_steps=None, class_labels=None, noise_type="gaussian", encode_chunk_size=8):
+        rgb_latent = self.encode(rgb, encode_chunk_size=encode_chunk_size)
 
         self.scheduler.set_timesteps(num_inference_steps, device=rgb.device)
 
@@ -144,6 +174,7 @@ class GVMPipeline(DiffusionPipeline, GVMLoraLoader):
         num_interp_frames,
         decode_chunk_size,
         num_inference_steps,
+        encode_chunk_size=8,
         use_clip_img_emb=False,
         noise_type='zeros',
         mode='matte',
@@ -170,7 +201,8 @@ class GVMPipeline(DiffusionPipeline, GVMLoraLoader):
                 num_inference_steps=num_inference_steps,
                 class_labels=class_embedding,
                 position_ids=position_ids,
-                noise_type=noise_type
+                noise_type=noise_type,
+                encode_chunk_size=encode_chunk_size,
             )
         else:
             # assert 2 <= num_overlap_frames <= (num_interp_frames + 2 + 1) // 2
@@ -202,7 +234,8 @@ class GVMPipeline(DiffusionPipeline, GVMLoraLoader):
                     rgb[:, key_frame_indices[i] : key_frame_indices[i + 1] + 1],
                     position_ids=position_ids,
                     num_inference_steps=num_inference_steps,
-                    class_labels=class_embedding
+                    class_labels=class_embedding,
+                    encode_chunk_size=encode_chunk_size,
                 )
 
                 if pre_latent is not None:
@@ -230,6 +263,10 @@ class GVMPipeline(DiffusionPipeline, GVMLoraLoader):
                     torch.cuda.empty_cache()
 
             assert latent_all.shape[1] == image.shape[1]
+
+        # Clear any lingering CUDA memory before the decode
+        if image.device.type == "cuda":
+            torch.cuda.empty_cache()
 
         alpha = self.decode(latent_all, decode_chunk_size=decode_chunk_size)
 
