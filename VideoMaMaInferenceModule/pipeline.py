@@ -888,6 +888,19 @@ class VideoInferencePipeline:
         self.vae.to(load_device, dtype=torch.float32).eval()
         self.unet.to(load_device, dtype=self.weight_dtype).eval()
 
+        # In low_vram mode, also engage diffusers' built-in VAE memory
+        # mitigations: slicing breaks the latent batch into per-frame calls
+        # and tiling breaks each call into spatial tiles.  These are no-ops
+        # for cards with plenty of headroom but critical for 8 GiB.
+        if low_vram:
+            try:
+                self.vae.enable_slicing()
+                self.vae.enable_tiling()
+            except AttributeError:
+                # Older diffusers VAEs don't have these — fall back to the
+                # manual chunk_size=1 path in _tensor_to_vae_latent / decode.
+                pass
+
         logger.info(
             "--- Models Loaded Successfully on %s (low_vram=%s) ---",
             load_device, low_vram,
@@ -1001,12 +1014,17 @@ class VideoInferencePipeline:
 
             frames = []
             # Process in chunks to avoid VRAM issues, especially for long videos
-            # Decode in FP32
+            # Decode in FP32.  low_vram drops the per-call frame count to 1 and
+            # empties the cache between calls (same reasoning as the encode
+            # path: the VAE decoder's intermediate activations are huge).
             pred_latents_fp32 = pred_latents.to(dtype=torch.float32)
-            for i in range(0, pred_latents_fp32.shape[0], 8):
-                chunk = pred_latents_fp32[i: i + 8]
+            decode_chunk_size = 1 if self.low_vram else 8
+            for i in range(0, pred_latents_fp32.shape[0], decode_chunk_size):
+                chunk = pred_latents_fp32[i: i + decode_chunk_size]
                 decoded_chunk = self.vae.decode(chunk, num_frames=chunk.shape[0]).sample
                 frames.append(decoded_chunk)
+                if self.low_vram and self.execution_device.type == "cuda":
+                    torch.cuda.empty_cache()
             self._to_cpu(self.vae)
 
             video_tensor = torch.cat(frames, dim=0)
@@ -1025,16 +1043,21 @@ class VideoInferencePipeline:
         """Encodes a video tensor into the VAE's latent space in chunks to avoid OOM."""
         video_length = t.shape[1]
         t = rearrange(t, "b f c h w -> (b f) c h w")
-        
-        # Process in chunks of 8
-        chunk_size = 8
+
+        # In low_vram mode the first conv of the VAE encoder produces ~1.7 GiB
+        # of activations per 8-frame chunk at 752×560 — drop to 1 frame so the
+        # encoder peak fits, plus empty_cache between chunks to release each
+        # chunk's activations before the next one starts.
+        chunk_size = 1 if self.low_vram else 8
         latents_list = []
-        
+
         for i in range(0, t.shape[0], chunk_size):
             chunk = t[i:i + chunk_size]
             chunk_latents = self.vae.encode(chunk).latent_dist.sample()
             latents_list.append(chunk_latents)
-            
+            if self.low_vram and self.execution_device.type == "cuda":
+                torch.cuda.empty_cache()
+
         latents = torch.cat(latents_list, dim=0)
         latents = rearrange(latents, "(b f) c h w -> b f c h w", f=video_length)
         return latents * self.vae.config.scaling_factor
