@@ -83,6 +83,22 @@ class CorridorKeyEngine:
         self._is_rocm = hasattr(torch.version, "hip") and torch.version.hip
         self.model = self._load_model()
 
+        # Refiner scale as a 1-element device tensor so torch.compile / CUDA
+        # graphs treat it as data, not a Python constant baked into the
+        # captured graph.  A plain float in a forward_hook closure gets
+        # specialised on the first call and silently ignores later changes.
+        # Always-on hook avoids a Python branch (which would create a guard
+        # and either bake one branch or break the graph).
+        self._refiner_scale_t = torch.ones(1, device=self.device, dtype=self.model_precision)
+        self._refiner_hook_handle = None
+        if self.model.refiner is not None:
+            scale_tensor = self._refiner_scale_t  # capture tensor, not 'self'
+
+            def _scale_hook(module, _input, output):
+                return output * scale_tensor
+
+            self._refiner_hook_handle = self.model.refiner.register_forward_hook(_scale_hook)
+
         # torch.compile needs: cl.exe (Windows), gcc (Linux), and Triton.
         # Check prerequisites and skip with a helpful message if missing.
         import shutil
@@ -459,24 +475,17 @@ class CorridorKeyEngine:
         # Free up unused VRAM in order to keep peak usage down and avoid OOM errors
         del image, mask_linear
 
-        # 5. Inference
-        # Hook for Refiner Scaling
-        handle = None
-        if refiner_scale != 1.0 and self.model.refiner is not None:
-
-            def scale_hook(module, input, output):
-                return output * refiner_scale
-
-            handle = self.model.refiner.register_forward_hook(scale_hook)
+        # 5. Inference — refiner scale is updated in-place on the device
+        # tensor so the persistent forward_hook (registered in __init__)
+        # picks up the new value without re-tracing the compiled graph.
+        if self.model.refiner is not None:
+            self._refiner_scale_t.fill_(refiner_scale)
 
         with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.mixed_precision):
             prediction = self.model(inp_t)
 
         # Free up unused VRAM in order to keep peak usage down and avoid OOM errors
         del inp_t
-
-        if handle:
-            handle.remove()
 
         if post_process_on_gpu:
             out = self._postprocess_torch(
