@@ -91,7 +91,9 @@ class RefinerBlock(nn.Module):
         out = self.relu(out)
         out = self.conv2(out)
         out = self.gn2(out)
-        out += residual
+        # Avoid in-place add: aliased buffers under CUDA graphs / torch.compile
+        # reduce-overhead can corrupt the residual reference between replays.
+        out = out + residual
         out = self.relu(out)
         return out
 
