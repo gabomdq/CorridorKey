@@ -188,7 +188,7 @@ def _run_engine(
 # --- On-disk cache ------------------------------------------------------------
 #
 # Re-runs with the same input but different output options (cut range, scale,
-# crop, framerate, codec settings) shouldn't re-run BiRefNet/VideoMaMa or the
+# crop, framerate, codec settings) shouldn't re-run BiRefNet/GVM or the
 # CorridorKey engine.  We cache two artifacts per frame, both indexed by the
 # global frame index, in a single shared cache folder so multiple inputs can
 # coexist without separate top-level dirs:
@@ -289,33 +289,34 @@ def _write_cached_alphahint(path: Path, alpha_f32: np.ndarray) -> None:
     cv2.imwrite(str(path), (np.clip(alpha_f32, 0, 1) * 255).astype(np.uint8))
 
 
-# --- VideoMaMa (GVM) ----------------------------------------------------------
+# --- GVM (Generative Video Matting) ------------------------------------------
 
-def _generate_videomama_masks(
+def _generate_gvm_masks(
     input_path: Path, output_dir: Path, input_stem: str, device: str,
 ) -> list[Path]:
-    """Run GVM (VideoMaMa) on ``input_path`` and write per-frame mask PNGs into
+    """Run GVM on ``input_path`` and write per-frame mask PNGs into
     ``output_dir`` using ``<input_stem>_NNNNNN.png`` names so the shared cache
     folder can hold output for multiple inputs.
 
-    Mirrors the parameters used by ``clip_manager.generate_alphas`` — single-
-    frame batches and a 1-step denoise so the diffusion stays fast and the
-    output is per-frame deterministic enough for downstream chroma keying.
-    Drops the GVM model from VRAM before returning so the inference engine
-    can be loaded next.
+    GVM is the auto-matte path used by the ``g`` action of the wizard
+    (``clip_manager.generate_alphas``).  Mirrors its parameters — single-frame
+    batches and a 1-step denoise so the diffusion stays fast and the output
+    is per-frame deterministic enough for downstream chroma keying.  Drops
+    the GVM model from VRAM before returning so the inference engine can
+    be loaded next.
 
     GVM writes its own ``0001.png`` counter scheme; we capture into a tempdir
     and then move/rename into the shared cache with the stem-prefixed names.
     """
     from clip_manager import get_gvm_processor
 
-    log.info("Loading VideoMaMa (GVM) on %s ...", device)
+    log.info("Loading GVM on %s ...", device)
     processor = get_gvm_processor(device=device)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="gvm_raw_") as gvm_raw:
-        log.info("Generating per-frame alpha masks via VideoMaMa ...")
+        log.info("Generating per-frame alpha masks via GVM ...")
         processor.process_sequence(
             input_path=str(input_path),
             output_dir=None,
@@ -514,29 +515,29 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
         return
 
     # Some keyed frames missing → we need the inference engine (and possibly
-    # the alpha generator).  For VideoMaMa, masks are batch-generated for the
-    # whole video; if ANY mask is missing we regenerate them all (this input's
-    # files only — other inputs in the shared cache are left intact).  For
-    # BiRefNet, alpha generation is per-frame so partial caches are fine.
-    if args.alpha_method == "videomama":
+    # the alpha generator).  For GVM, masks are batch-generated for the whole
+    # video; if ANY mask is missing we regenerate them all (this input's files
+    # only — other inputs in the shared cache are left intact).  For BiRefNet,
+    # alpha generation is per-frame so partial caches are fine.
+    if args.alpha_method == "gvm":
         if alpha_dir is not None and not _all_present(alpha_dir, input_stem, 0, n_total):
             if alpha_dir.is_dir():
-                # Partial videomama output is unsafe — clear THIS input's masks
-                # and regenerate.  Other inputs sharing the dir are untouched.
+                # Partial GVM output is unsafe — clear THIS input's masks and
+                # regenerate.  Other inputs sharing the dir are untouched.
                 stale = list(alpha_dir.glob(f"{input_stem}_*.png"))
                 if stale:
                     log.info(
-                        "VideoMaMa cache for %r incomplete; clearing %d stale files",
+                        "GVM cache for %r incomplete; clearing %d stale files",
                         input_stem, len(stale),
                     )
                     for f in stale:
                         f.unlink()
-            _generate_videomama_masks(input_path, alpha_dir, input_stem, args.device)
+            _generate_gvm_masks(input_path, alpha_dir, input_stem, args.device)
         elif alpha_dir is None:
             # Caching disabled: write masks to a tempdir for this run only.
             tmp_holder = tempfile.TemporaryDirectory(prefix="corridorkey_alpha_")
             alpha_dir = Path(tmp_holder.name)
-            _generate_videomama_masks(input_path, alpha_dir, input_stem, args.device)
+            _generate_gvm_masks(input_path, alpha_dir, input_stem, args.device)
             args._tmp_alpha_holder = tmp_holder  # keep alive until end of run
 
     # BiRefNet handler is created lazily on the first uncached alpha hint.
@@ -547,9 +548,9 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
         cached = _frame_path(alpha_dir, input_stem, idx)
         if cached and cached.is_file():
             return _read_cached_alphahint(cached)
-        if args.alpha_method == "videomama":
+        if args.alpha_method == "gvm":
             raise RuntimeError(
-                f"VideoMaMa mask missing for frame {idx} of {input_stem!r} after "
+                f"GVM mask missing for frame {idx} of {input_stem!r} after "
                 f"generation pass — check cache dir {alpha_dir}"
             )
         if handler is None:
@@ -627,7 +628,7 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
         del handler, engine
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        # Clean up the tempdir holder for the no-cache videomama path.
+        # Clean up the tempdir holder for the no-cache GVM path.
         holder = getattr(args, "_tmp_alpha_holder", None)
         if holder is not None:
             holder.cleanup()
@@ -678,10 +679,11 @@ def main() -> None:
 
     # --- Alpha hint generation ------------------------------------------------
     hint = parser.add_argument_group("alpha hint")
-    hint.add_argument("--alpha-method", default="birefnet", choices=("birefnet", "videomama"),
+    hint.add_argument("--alpha-method", default="birefnet", choices=("birefnet", "gvm"),
                       help="Alpha hint generator for video input (default: birefnet). "
-                           "videomama runs a two-pass: GVM writes per-frame masks to a tempdir, "
-                           "the CorridorKey engine then streams inference + WebM encoding.")
+                           "'gvm' runs the auto-matte path used by the wizard's `g` action: "
+                           "GVMProcessor generates per-frame masks for the whole clip first, "
+                           "then the CorridorKey engine streams inference + WebM encoding.")
     hint.add_argument("--birefnet-usage", default="Matting", metavar="USAGE",
                       help="BiRefNet model variant (default: Matting). See BiRefNetModule docs.")
     hint.add_argument("--alpha-hint", default=None,
