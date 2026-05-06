@@ -83,6 +83,13 @@ class CorridorKeyEngine:
         self._is_rocm = hasattr(torch.version, "hip") and torch.version.hip
         self.model = self._load_model()
 
+        # Pinned staging buffers for async H2D.  non_blocking=True is a no-op
+        # without pinned source memory; staging through these gives the .to()
+        # call a real DMA that overlaps with subsequent CPU work.
+        # Cached per-shape so a clip with consistent resolution allocates once.
+        self._h2d_image_pinned: torch.Tensor | None = None
+        self._h2d_mask_pinned: torch.Tensor | None = None
+
         # Refiner scale as a 1-element device tensor so torch.compile / CUDA
         # graphs treat it as data, not a Python constant baked into the
         # captured graph.  A plain float in a forward_hook closure gets
@@ -228,6 +235,30 @@ class CorridorKeyEngine:
             logger.warning("Model compilation failed. Falling back to eager mode.")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def _upload_via_pinned(self, np_arr: np.ndarray, cache_attr: str) -> torch.Tensor:
+        """Copy numpy [B,H,W,C] → device [B,C,H,W] tensor via a cached pinned buffer.
+
+        Pinned source memory makes ``.to(device, non_blocking=True)`` a real
+        async DMA; without pinning it silently degrades to a blocking copy.
+        The pinned buffer is cached on the engine and reallocated only when
+        the input shape changes (a clip at fixed resolution allocates once).
+        """
+        src = torch.from_numpy(np_arr)
+        pinned = getattr(self, cache_attr)
+        if pinned is None or pinned.shape != src.shape:
+            pinned = torch.empty(src.shape, dtype=torch.float32, pin_memory=True)
+            setattr(self, cache_attr, pinned)
+        # copy_ from uint8 → float32 casts numerically (0..255), so we still
+        # need the explicit /255 scaling that TF.to_dtype(scale=True) was doing.
+        if src.dtype == torch.uint8:
+            pinned.copy_(src).div_(255.0)
+        else:
+            pinned.copy_(src)
+        out = pinned.to(self.device, non_blocking=True).permute(0, 3, 1, 2)
+        if self.model_precision != torch.float32:
+            out = out.to(self.model_precision)
+        return out
 
     def _preprocess_input(
         self, image_batch: torch.Tensor, mask_batch_linear: torch.Tensor, input_is_linear: bool
@@ -457,18 +488,26 @@ class CorridorKeyEngine:
             mask_linear = mask_linear[np.newaxis, :]
 
         bs, h, w = image.shape[:3]
+        mask_linear = mask_linear.reshape((bs, h, w, 1))
 
         # 1. Inputs Check & Normalization
-        image = TF.to_dtype(
-            torch.from_numpy(image).permute((0, 3, 1, 2)),
-            self.model_precision,
-            scale=True,
-        ).to(self.device, non_blocking=True)
-        mask_linear = TF.to_dtype(
-            torch.from_numpy(mask_linear.reshape((bs, h, w, 1))).permute((0, 3, 1, 2)),
-            self.model_precision,
-            scale=True,
-        ).to(self.device, non_blocking=True)
+        if self.device.type == "cuda":
+            # Stage through pinned float32 buffers in BHWC layout.  Pinned
+            # source memory is required for the .to(non_blocking=True) DMA
+            # to actually overlap; without it, .to() blocks on the H2D copy.
+            image = self._upload_via_pinned(image, "_h2d_image_pinned")
+            mask_linear = self._upload_via_pinned(mask_linear, "_h2d_mask_pinned")
+        else:
+            image = TF.to_dtype(
+                torch.from_numpy(image).permute((0, 3, 1, 2)),
+                self.model_precision,
+                scale=True,
+            ).to(self.device, non_blocking=True)
+            mask_linear = TF.to_dtype(
+                torch.from_numpy(mask_linear).permute((0, 3, 1, 2)),
+                self.model_precision,
+                scale=True,
+            ).to(self.device, non_blocking=True)
 
         inp_t = self._preprocess_input(image, mask_linear, input_is_linear)
 
