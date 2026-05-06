@@ -289,6 +289,59 @@ def _write_cached_alphahint(path: Path, alpha_f32: np.ndarray) -> None:
     cv2.imwrite(str(path), (np.clip(alpha_f32, 0, 1) * 255).astype(np.uint8))
 
 
+# --- BiRefNet batch (whole-clip pre-pass) ------------------------------------
+
+def _generate_birefnet_masks(
+    input_path: Path,
+    output_dir: Path,
+    input_stem: str,
+    device: str,
+    usage: str,
+) -> list[Path]:
+    """Run BiRefNet over every frame of ``input_path`` up-front.
+
+    Same per-frame algorithm as the streaming path
+    (:func:`_birefnet_alpha_for_frame`), but does the whole clip in one
+    pass and writes the results to the cache.  Used when VideoMaMa is
+    requested with ``--mask-hint birefnet`` and there are no cached
+    BiRefNet hints yet for this input.
+    """
+    handler = _create_birefnet(device, usage)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(str(input_path))
+    n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    log.info("Running BiRefNet over %d frames → %s ...", n_total, output_dir)
+
+    written: list[Path] = []
+    try:
+        idx = 0
+        last_log = time.monotonic()
+        while True:
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            alpha = _birefnet_alpha_for_frame(handler, frame_rgb)
+            dst = output_dir / _frame_filename(input_stem, idx)
+            _write_cached_alphahint(dst, alpha)
+            written.append(dst)
+            idx += 1
+            now = time.monotonic()
+            if now - last_log >= 5.0:
+                log.info("BiRefNet: %d/%d frames", idx, n_total)
+                last_log = now
+    finally:
+        cap.release()
+        handler.cleanup()
+        del handler
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    log.info("BiRefNet wrote %d masks → %s", len(written), output_dir)
+    return written
+
+
 # --- VideoMaMa (mask-hint refinement) ----------------------------------------
 
 def _find_cached_videomama_hint_source(
@@ -702,22 +755,64 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
                 _generate_gvm_masks(input_path, target_dir, input_stem, args.device)
                 return
 
-            # videomama: pick the hint source.  --mask-hint takes priority;
-            # otherwise auto-detect from cache (alphahint_gvm preferred,
-            # alphahint_birefnet fallback).
-            if args.mask_hint:
+            # videomama needs a coarse mask hint.  Three ways to supply it:
+            #   1) --mask-hint birefnet|gvm  → use that method's cached hints,
+            #      and if they aren't present yet, run that method first to
+            #      populate the cache (or a tempdir, if caching is off).
+            #   2) --mask-hint <path>        → external dir or video file.
+            #   3) --mask-hint omitted       → auto-detect from cache
+            #      (alphahint_gvm preferred, alphahint_birefnet fallback;
+            #      error out if neither exists).
+            hint_method: str | None = (
+                args.mask_hint if args.mask_hint in ("birefnet", "gvm") else None
+            )
+
+            if hint_method:
+                # Method-name path: cache subdir for this method (or tempdir
+                # when --no-cache).  Generate first if not present yet.
+                if cache_root is not None:
+                    hint_dir = cache_root / f"alphahint_{hint_method}"
+                else:
+                    tmp_hints = tempfile.TemporaryDirectory(prefix="corridorkey_hints_")
+                    hint_dir = Path(tmp_hints.name)
+                    args._tmp_hint_holder = tmp_hints  # keep alive for this run
+
+                if not _all_present(hint_dir, input_stem, 0, n_total):
+                    log.info(
+                        "VideoMaMa: %s hints not cached for %r; running %s first.",
+                        hint_method, input_stem, hint_method,
+                    )
+                    if hint_method == "birefnet":
+                        _generate_birefnet_masks(
+                            input_path, hint_dir, input_stem,
+                            args.device, args.birefnet_usage,
+                        )
+                    else:  # gvm
+                        _generate_gvm_masks(
+                            input_path, hint_dir, input_stem, args.device,
+                        )
+                else:
+                    log.info("VideoMaMa: refining cached %s hints.", hint_method)
+
+                hint_path = hint_dir
+                hint_stem_filter: str | None = input_stem
+
+            elif args.mask_hint:
                 hint_path = Path(args.mask_hint)
-                hint_stem_filter: str | None = None
+                hint_stem_filter = None
                 log.info("VideoMaMa: using user-supplied mask hint: %s", hint_path)
+
             else:
                 found = _find_cached_videomama_hint_source(cache_root, input_stem)
                 if found is None:
                     sys.exit(
                         f"VideoMaMa needs a coarse alpha hint to refine, but none was "
                         f"found for {input_stem!r}. Either:\n"
-                        f"  1) Run --alpha-method=birefnet or --alpha-method=gvm first "
+                        f"  1) Pass --mask-hint birefnet (or gvm) to auto-generate the "
+                        f"hints first, then refine.\n"
+                        f"  2) Run --alpha-method=birefnet or --alpha-method=gvm first "
                         f"to populate the cache, then re-run with --alpha-method=videomama.\n"
-                        f"  2) Pass --mask-hint <video-or-dir> with an externally produced hint."
+                        f"  3) Pass --mask-hint <video-or-dir> with an externally produced hint."
                     )
                 hint_path, hint_method = found
                 hint_stem_filter = input_stem
@@ -898,12 +993,14 @@ def main() -> None:
                       help="BiRefNet model variant (default: Matting). See BiRefNetModule docs.")
     hint.add_argument("--alpha-hint", default=None,
                       help="Image-only: path to a pre-computed alpha hint PNG (bypasses BiRefNet)")
-    hint.add_argument("--mask-hint", default=None, metavar="PATH",
-                      help="VideoMaMa-only: external coarse mask hint to refine (overrides "
-                           "auto-detection). Either a directory of mask images (PNG/JPG/EXR) "
-                           "or a video file. When omitted, --alpha-method=videomama "
-                           "auto-detects cached hints (prefers alphahint_gvm/, falls back to "
-                           "alphahint_birefnet/) and errors out if neither exists. "
+    hint.add_argument("--mask-hint", default=None, metavar="SOURCE",
+                      help="VideoMaMa-only. Three ways to specify the coarse mask hint:\n"
+                           "  birefnet|gvm  use that method's cached hints; if they aren't "
+                           "cached yet for this input, run the method first to generate them.\n"
+                           "  PATH          external directory of mask images (PNG/JPG/EXR) "
+                           "or a video file — used as-is, no auto-generate.\n"
+                           "  (omitted)     auto-detect cached hints (prefers alphahint_gvm/, "
+                           "falls back to alphahint_birefnet/); errors out if neither exists.\n"
                            "All hints are force-thresholded to binary before VideoMaMa.")
     hint.add_argument("--videomama-chunk-size", type=int, default=50, metavar="N",
                       help="VideoMaMa-only: number of frames per inference chunk "
@@ -952,6 +1049,8 @@ def main() -> None:
     if args.mask_hint is not None:
         if args.alpha_method != "videomama":
             log.warning("--mask-hint is only used with --alpha-method=videomama; ignoring.")
+        elif args.mask_hint in ("birefnet", "gvm"):
+            pass  # method-name path; existence is irrelevant
         elif not Path(args.mask_hint).exists():
             sys.exit(f"--mask-hint not found: {args.mask_hint}")
 
