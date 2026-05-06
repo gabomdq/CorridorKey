@@ -71,7 +71,6 @@ def resolve_backend(requested: str | None = None) -> str:
     return backend
 
 
-CHECKPOINT_DIR = os.path.join("CorridorKeyModule", "checkpoints")
 MLX_MODEL_URL = "https://github.com/nikopueringer/corridorkey-mlx/releases/download/v1.0.0/corridorkey_mlx.safetensors"
 MLX_MODEL_FILENAME = "corridorkey_mlx.safetensors"
 
