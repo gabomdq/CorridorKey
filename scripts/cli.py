@@ -745,7 +745,14 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
 
     # Fast path: every requested frame is already keyed on disk → encode only.
     if _all_present(keyed_dir, input_stem, start, end):
-        log.info("All %d keyed frames cached; skipping models, encode-only.", n_frames)
+        log.info(
+            "FAST PATH: all %d keyed frames cached for %r — skipping alpha + "
+            "inference, encode-only. Pass --clean to invalidate this cache "
+            "and re-run inference (necessary when --despill-strength, "
+            "--refiner-scale, --image-size, --screen-color, or "
+            "--gpu-post-processing change).",
+            n_frames, input_stem,
+        )
         _encode_from_keyed_cache(
             keyed_dir,  # type: ignore[arg-type]  # _all_present guarantees not None
             input_stem,
@@ -922,6 +929,21 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
 
     if keyed_dir is not None:
         keyed_dir.mkdir(parents=True, exist_ok=True)
+
+    # Report cache breakdown so it's obvious how many frames will hit
+    # inference vs. be re-used from the keyed cache.
+    if keyed_dir is not None and keyed_dir.is_dir():
+        cached_count = sum(
+            (keyed_dir / _frame_filename(input_stem, idx)).is_file()
+            for idx in range(start, end)
+        )
+    else:
+        cached_count = 0
+    if cached_count:
+        log.info(
+            "Cache breakdown: %d/%d keyed frames cached (re-used), %d to infer.",
+            cached_count, n_frames, n_frames - cached_count,
+        )
 
     cap = cv2.VideoCapture(str(input_path))
     if start > 0:
