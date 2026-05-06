@@ -42,6 +42,13 @@ def _make_engine_with_mock(mock_greenformer, img_size=64, device="cpu"):
     engine.model = mock_greenformer
     engine.model_precision = torch.float32
     engine.mixed_precision = True
+    # Attributes added by the perf-port commits (pinned H2D buffers + refiner
+    # scale tensor).  The factory bypasses __init__ so they need to be set
+    # manually here, matching the production initialisation.
+    engine._h2d_image_pinned = None
+    engine._h2d_mask_pinned = None
+    engine._refiner_scale_t = torch.ones(1, device=torch.device(device), dtype=torch.float32)
+    engine._refiner_hook_handle = None
     return engine
 
 

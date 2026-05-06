@@ -57,6 +57,8 @@ def linear_to_srgb(x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
     Converts Linear to sRGB using the official piecewise sRGB transfer function.
     Supports both Numpy arrays and PyTorch tensors.
     """
+    if isinstance(x, torch.Tensor):
+        return _linear_to_srgb_torch(x)
     x = _clamp(x, 0.0)
     mask = x <= 0.0031308
     return _where(mask, x * 12.92, 1.055 * _power(x, 1.0 / 2.4) - 0.055)
@@ -67,9 +69,28 @@ def srgb_to_linear(x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
     Converts sRGB to Linear using the official piecewise sRGB transfer function.
     Supports both Numpy arrays and PyTorch tensors.
     """
+    if isinstance(x, torch.Tensor):
+        return _srgb_to_linear_torch(x)
     x = _clamp(x, 0.0)
     mask = x <= 0.04045
     return _where(mask, x / 12.92, _power((x + 0.055) / 1.055, 2.4))
+
+
+def _linear_to_srgb_torch(x: torch.Tensor) -> torch.Tensor:
+    """Fused linear→sRGB for torch tensors — fewer temporaries / mask allocs
+    than the dtype-generic ``linear_to_srgb`` path; compile-friendly."""
+    x = x.clamp(min=0.0)
+    low = x * 12.92
+    high = 1.055 * x.clamp(min=0.0031308).pow(1.0 / 2.4) - 0.055
+    return torch.where(x <= 0.0031308, low, high)
+
+
+def _srgb_to_linear_torch(x: torch.Tensor) -> torch.Tensor:
+    """Fused sRGB→linear for torch tensors — counterpart to ``_linear_to_srgb_torch``."""
+    x = x.clamp(min=0.0)
+    low = x / 12.92
+    high = ((x + 0.055) / 1.055).pow(2.4)
+    return torch.where(x <= 0.04045, low, high)
 
 
 def premultiply(fg: np.ndarray | torch.Tensor, alpha: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
@@ -98,6 +119,10 @@ def composite_straight(
     Composites Straight FG over BG.
     Formula: FG * Alpha + BG * (1 - Alpha)
     """
+    if isinstance(fg, torch.Tensor):
+        # torch.lerp(start, end, weight) = start + weight * (end - start)
+        # which is equivalent to FG*alpha + BG*(1-alpha) — but a single fused op.
+        return torch.lerp(bg, fg, alpha)
     return fg * alpha + bg * (1.0 - alpha)
 
 
@@ -108,6 +133,10 @@ def composite_premul(
     Composites Premultiplied FG over BG.
     Formula: FG + BG * (1 - Alpha)
     """
+    if isinstance(fg, torch.Tensor):
+        # addcmul(input, t1, t2, value=1) = input + value * t1 * t2
+        # = FG + 1 * BG * (1-alpha), one fused kernel.
+        return torch.addcmul(fg, bg, 1.0 - alpha)
     return fg + bg * (1.0 - alpha)
 
 
@@ -279,28 +308,31 @@ def despill_opencv(
 
 
 def despill_torch(image: torch.Tensor, strength: float, screen_channel: int = 1) -> torch.Tensor:
-    """GPU despill — keeps data on device. screen_channel: 0=R, 1=G, 2=B."""
+    """GPU despill — keeps data on device. screen_channel: 0=R, 1=G, 2=B.
+
+    Operates in-place on a clone of ``image`` to avoid the three-tensor
+    ``torch.stack`` allocation per call.  ``screen_channel`` selects which
+    channel hosts the spill — kept for blue-screen support (PR #241).
+    """
     if screen_channel not in (0, 1, 2):
         raise ValueError(f"screen_channel must be 0, 1, or 2, got {screen_channel}")
     if strength <= 0.0:
         return image
+    out = image.clone()
     other_a, other_b = (i for i in (0, 1, 2) if i != screen_channel)
-    screen = image[:, screen_channel]
-    a = image[:, other_a]
-    b = image[:, other_b]
-    limit = (a + b) / 2.0
-    spill = torch.clamp(screen - limit, min=0.0)
-    screen_new = screen - spill
-    a_new = a + spill * 0.5
-    b_new = b + spill * 0.5
-    out_channels: list[torch.Tensor] = [None, None, None]  # type: ignore[list-item]
-    out_channels[screen_channel] = screen_new
-    out_channels[other_a] = a_new
-    out_channels[other_b] = b_new
-    despilled = torch.stack(out_channels, dim=1)
+    screen = out[:, screen_channel]   # mutable view
+    a = out[:, other_a]
+    b = out[:, other_b]
+    limit = (a + b) / 2.0              # one new alloc; reused below
+    spill = (screen - limit).clamp_(min=0.0)
+    screen.sub_(spill)                 # screen -= spill
+    spill_half = spill.mul_(0.5)       # reuse spill buffer
+    a.add_(spill_half)                 # a += spill/2
+    b.add_(spill_half)                 # b += spill/2
     if strength < 1.0:
-        return image * (1.0 - strength) + despilled * strength
-    return despilled
+        # Blend original ↔ despilled with lerp (start, end, weight).
+        return torch.lerp(image, out, strength)
+    return out
 
 
 # --- Screen color: single source of truth ---------------------------------
@@ -497,10 +529,13 @@ def clean_matte_torch(alpha: torch.Tensor, area_threshold: int, dilation: int = 
         for _ in range(repeats):
             mask = F.max_pool2d(mask, 5, stride=1, padding=2)
 
-    # Blur for soft edges
+    # Blur for soft edges.  Cast to fp32 around the kernel construction —
+    # TF.gaussian_blur builds its kernel via torch.linspace, which Dynamo
+    # cannot trace in fp16.  Restore the original dtype after blur.
     if blur_size > 0:
         k = int(blur_size * 2 + 1)
-        mask = TF.gaussian_blur(mask, [k, k])
+        _dtype = mask.dtype
+        mask = TF.gaussian_blur(mask.float(), [k, k]).to(_dtype)
 
     return alpha * mask
 
