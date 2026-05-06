@@ -291,19 +291,46 @@ def _write_cached_alphahint(path: Path, alpha_f32: np.ndarray) -> None:
 
 # --- VideoMaMa (mask-hint refinement) ----------------------------------------
 
-def _read_mask_hint_frames(mask_hint_path: Path) -> list[np.ndarray]:
+def _find_cached_videomama_hint_source(
+    cache_root: Path | None, input_stem: str,
+) -> tuple[Path, str] | None:
+    """Locate an existing alpha-hint cache for ``input_stem`` to feed VideoMaMa.
+
+    Returns ``(dir, method_name)`` for the chosen source, or ``None`` if no
+    cached hints exist for this input.  Prefers ``alphahint_gvm/`` (higher-
+    quality coarse matte) over ``alphahint_birefnet/`` when both are present.
+    """
+    if cache_root is None:
+        return None
+    for method in ("gvm", "birefnet"):
+        d = cache_root / f"alphahint_{method}"
+        if d.is_dir() and any(d.glob(f"{input_stem}_*.png")):
+            return d, method
+    return None
+
+
+def _read_mask_hint_frames(
+    mask_hint_path: Path, *, stem_filter: str | None = None,
+) -> list[np.ndarray]:
     """Load a coarse mask hint as a list of binary-thresholded uint8 frames.
 
     Mirrors the wizard's behaviour in ``clip_manager.run_videomama``: accepts
     either a directory of mask images (PNG/JPG/EXR) or a video file, force-
     thresholds to binary at the same level (>10).
+
+    When ``stem_filter`` is given (used for the auto-detected cache source),
+    only ``<stem_filter>_*.png`` files in the dir are picked up — this skips
+    other inputs' caches that share the folder.
     """
     frames: list[np.ndarray] = []
     if mask_hint_path.is_dir():
-        files = sorted(
-            f for f in mask_hint_path.iterdir()
-            if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".exr")
-        )
+        if stem_filter is not None:
+            files = sorted(mask_hint_path.glob(f"{stem_filter}_*.png"))
+        else:
+            files = sorted(
+                f for f in mask_hint_path.iterdir()
+                if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".exr")
+            )
         for f in files:
             if f.suffix.lower() == ".exr":
                 m = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
@@ -342,6 +369,8 @@ def _generate_videomama_masks(
     input_stem: str,
     device: str,
     chunk_size: int,
+    *,
+    hint_stem_filter: str | None = None,
 ) -> list[Path]:
     """Run VideoMaMa on (input video, coarse mask hint) → per-frame refined
     alpha masks in ``output_dir`` as ``<input_stem>_NNNNNN.png``.
@@ -349,6 +378,10 @@ def _generate_videomama_masks(
     Mirrors the wizard's ``run_videomama`` (clip_manager.py) — same model
     loading pattern, same binary-threshold pre-processing on the mask hint,
     same chunked iteration.  Drops the pipeline from VRAM before returning.
+
+    ``hint_stem_filter`` is set when the hint dir is the shared cache
+    (``alphahint_<method>/``) so only this input's PNG files are picked up;
+    when reading a user-supplied directory or video, leave it as ``None``.
 
     NOTE: VideoMaMa requires every input frame and mask frame to be loaded
     into RAM at once (the inference module's API takes lists, not a stream),
@@ -379,7 +412,7 @@ def _generate_videomama_masks(
     log.info("Loaded %d input frames", len(input_frames))
 
     log.info("Reading mask hint from %s ...", mask_hint_path)
-    mask_frames = _read_mask_hint_frames(mask_hint_path)
+    mask_frames = _read_mask_hint_frames(mask_hint_path, stem_filter=hint_stem_filter)
     log.info("Loaded %d mask frames", len(mask_frames))
 
     n = min(len(input_frames), len(mask_frames))
@@ -667,15 +700,41 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
         def _run_alpha_gen(target_dir: Path) -> None:
             if args.alpha_method == "gvm":
                 _generate_gvm_masks(input_path, target_dir, input_stem, args.device)
-            else:  # videomama
-                _generate_videomama_masks(
-                    input_path,
-                    Path(args.mask_hint),
-                    target_dir,
-                    input_stem,
-                    args.device,
-                    args.videomama_chunk_size,
+                return
+
+            # videomama: pick the hint source.  --mask-hint takes priority;
+            # otherwise auto-detect from cache (alphahint_gvm preferred,
+            # alphahint_birefnet fallback).
+            if args.mask_hint:
+                hint_path = Path(args.mask_hint)
+                hint_stem_filter: str | None = None
+                log.info("VideoMaMa: using user-supplied mask hint: %s", hint_path)
+            else:
+                found = _find_cached_videomama_hint_source(cache_root, input_stem)
+                if found is None:
+                    sys.exit(
+                        f"VideoMaMa needs a coarse alpha hint to refine, but none was "
+                        f"found for {input_stem!r}. Either:\n"
+                        f"  1) Run --alpha-method=birefnet or --alpha-method=gvm first "
+                        f"to populate the cache, then re-run with --alpha-method=videomama.\n"
+                        f"  2) Pass --mask-hint <video-or-dir> with an externally produced hint."
+                    )
+                hint_path, hint_method = found
+                hint_stem_filter = input_stem
+                log.info(
+                    "VideoMaMa: refining cached %s alpha hints from %s",
+                    hint_method, hint_path,
                 )
+
+            _generate_videomama_masks(
+                input_path,
+                hint_path,
+                target_dir,
+                input_stem,
+                args.device,
+                args.videomama_chunk_size,
+                hint_stem_filter=hint_stem_filter,
+            )
 
         if alpha_dir is not None and not _all_present(alpha_dir, input_stem, 0, n_total):
             _clear_stale_for_input()
@@ -840,10 +899,12 @@ def main() -> None:
     hint.add_argument("--alpha-hint", default=None,
                       help="Image-only: path to a pre-computed alpha hint PNG (bypasses BiRefNet)")
     hint.add_argument("--mask-hint", default=None, metavar="PATH",
-                      help="VideoMaMa-only: coarse mask hint to refine. Either a directory "
-                           "of mask images (PNG/JPG/EXR, one per frame, sorted) or a video "
-                           "file. Required when --alpha-method=videomama; force-thresholded "
-                           "to binary before VideoMaMa inference.")
+                      help="VideoMaMa-only: external coarse mask hint to refine (overrides "
+                           "auto-detection). Either a directory of mask images (PNG/JPG/EXR) "
+                           "or a video file. When omitted, --alpha-method=videomama "
+                           "auto-detects cached hints (prefers alphahint_gvm/, falls back to "
+                           "alphahint_birefnet/) and errors out if neither exists. "
+                           "All hints are force-thresholded to binary before VideoMaMa.")
     hint.add_argument("--videomama-chunk-size", type=int, default=50, metavar="N",
                       help="VideoMaMa-only: number of frames per inference chunk "
                            "(default: 50, matches the wizard).")
@@ -888,13 +949,11 @@ def main() -> None:
     if args.no_despeckle:
         args.despeckle_size = 0
 
-    if args.alpha_method == "videomama":
-        if args.mask_hint is None:
-            sys.exit("--alpha-method videomama requires --mask-hint <video-or-dir>")
-        if not Path(args.mask_hint).exists():
+    if args.mask_hint is not None:
+        if args.alpha_method != "videomama":
+            log.warning("--mask-hint is only used with --alpha-method=videomama; ignoring.")
+        elif not Path(args.mask_hint).exists():
             sys.exit(f"--mask-hint not found: {args.mask_hint}")
-    elif args.mask_hint is not None:
-        log.warning("--mask-hint is only used with --alpha-method=videomama; ignoring.")
 
     args.device = resolve_device(args.device)
     log.info("Using device: %s", args.device)
