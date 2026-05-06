@@ -614,6 +614,8 @@ def run_image(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
         if alpha_raw is None:
             sys.exit(f"Cannot read alpha hint: {args.alpha_hint}")
         alpha_hint = alpha_raw.astype(np.float32) / 255.0
+        if alpha_hint.shape[:2] != (h, w):
+            alpha_hint = cv2.resize(alpha_hint, (w, h), interpolation=cv2.INTER_LINEAR)
         log.info("Using provided alpha hint: %s", args.alpha_hint)
     else:
         handler = _create_birefnet(args.device, args.birefnet_usage)
@@ -846,20 +848,28 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
 
     def alpha_provider(idx: int, frame_rgb: np.ndarray) -> np.ndarray:
         nonlocal handler
+        h, w = frame_rgb.shape[:2]
         cached = _frame_path(alpha_dir, input_stem, idx)
         if cached and cached.is_file():
-            return _read_cached_alphahint(cached)
-        if args.alpha_method in ("gvm", "videomama"):
+            alpha = _read_cached_alphahint(cached)
+        elif args.alpha_method in ("gvm", "videomama"):
             raise RuntimeError(
                 f"{args.alpha_method.upper()} mask missing for frame {idx} of "
                 f"{input_stem!r} after generation pass — check cache dir {alpha_dir}"
             )
-        if handler is None:
-            handler = _create_birefnet(args.device, args.birefnet_usage)
-        alpha = _birefnet_alpha_for_frame(handler, frame_rgb)
-        if cached is not None:
-            cached.parent.mkdir(parents=True, exist_ok=True)
-            _write_cached_alphahint(cached, alpha)
+        else:
+            if handler is None:
+                handler = _create_birefnet(args.device, args.birefnet_usage)
+            alpha = _birefnet_alpha_for_frame(handler, frame_rgb)
+            if cached is not None:
+                cached.parent.mkdir(parents=True, exist_ok=True)
+                _write_cached_alphahint(cached, alpha)
+        # GVM masks are saved at GVM's processing resolution (e.g. 576p on an
+        # 8 GiB card), which doesn't match the input video's native size.
+        # Mirror clip_manager.run_inference: resize the alpha to match the
+        # frame's H×W before handing to the engine.
+        if alpha.shape[:2] != (h, w):
+            alpha = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_LINEAR)
         return alpha
 
     engine = _create_engine(
