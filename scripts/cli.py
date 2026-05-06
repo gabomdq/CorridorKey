@@ -510,7 +510,17 @@ def _generate_videomama_masks(
     )
 
     log.info("Loading VideoMaMa pipeline on %s ...", device)
-    pipeline = load_videomama_model(device=device)
+    try:
+        pipeline = load_videomama_model(device=device)
+    except FileNotFoundError as e:
+        sys.exit(
+            f"VideoMaMa weights are not installed: {e}\n"
+            f"Run the installer to download them:\n"
+            f"  Linux/Mac: bash {_project_root}/Install_VideoMaMa_Linux_Mac.sh\n"
+            f"  Windows:   {_project_root}\\Install_VideoMaMa_Windows.bat\n"
+            f"Or use --alpha-method=birefnet (no extra weights needed) or "
+            f"--alpha-method=gvm if those weights are already present."
+        )
 
     log.info("Reading input frames from %s ...", input_path)
     cap = cv2.VideoCapture(str(input_path))
