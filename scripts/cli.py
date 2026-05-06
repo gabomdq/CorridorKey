@@ -164,6 +164,8 @@ def _run_engine(
     despeckle_size: int,
     refiner_scale: float,
     input_is_linear: bool,
+    post_process_on_gpu: bool,
+    screen_channel: int,
 ) -> dict:
     """Run a single inference call.  ``image_rgb`` is [H,W,3] sRGB float;
     ``alpha_hint`` is [H,W] float in [0,1]."""
@@ -181,8 +183,20 @@ def _run_engine(
         despeckle_size=max(despeckle_size, 1),
         refiner_scale=refiner_scale,
         generate_comp=False,
-        post_process_on_gpu=True,
+        post_process_on_gpu=post_process_on_gpu,
+        screen_channel=screen_channel,
     )
+
+
+def _detect_screen_color(image_rgb: np.ndarray, alpha_hint: np.ndarray) -> str:
+    """Probe a single (image, alpha) pair to pick green vs blue.
+
+    Mirrors ``clip_manager._resolve_screen_color`` for "auto" — uses
+    :func:`CorridorKeyModule.core.color_utils.estimate_screen_color`,
+    which inspects pixels with ``alpha < 0.3`` (the screen background).
+    """
+    from CorridorKeyModule.core.color_utils import estimate_screen_color
+    return estimate_screen_color(image_rgb, alpha_hint)
 
 
 # --- On-disk cache ------------------------------------------------------------
@@ -631,6 +645,13 @@ def run_image(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+    if args.screen_color == "auto":
+        args.screen_color = _detect_screen_color(image_rgb, alpha_hint)
+        log.info("Auto-detected screen color: %s", args.screen_color)
+
+    from CorridorKeyModule.core.color_utils import screen_channel_for_color
+    screen_channel = screen_channel_for_color(args.screen_color)
+
     engine = _create_engine(
         device=args.device, screen_color=args.screen_color,
         image_size=args.image_size, backend=args.backend,
@@ -643,6 +664,8 @@ def run_image(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
         despeckle_size=args.despeckle_size,
         refiner_scale=args.refiner_scale,
         input_is_linear=args.input_is_linear,
+        post_process_on_gpu=args.gpu_post_processing,
+        screen_channel=screen_channel,
     )
     del engine
     if torch.cuda.is_available():
@@ -872,6 +895,26 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
             alpha = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_LINEAR)
         return alpha
 
+    # Auto-detect screen color: probe frame `start` and its alpha hint.
+    # alpha_provider populates the cache on first call so this work isn't
+    # wasted — the alpha is reused inside the main loop.
+    if args.screen_color == "auto":
+        cap_probe = cv2.VideoCapture(str(input_path))
+        cap_probe.set(cv2.CAP_PROP_POS_FRAMES, start)
+        ret_probe, probe_bgr = cap_probe.read()
+        cap_probe.release()
+        if not ret_probe:
+            log.warning("Auto screen-color: cannot read frame %d, defaulting to green.", start)
+            args.screen_color = "green"
+        else:
+            probe_rgb = cv2.cvtColor(probe_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            probe_alpha = alpha_provider(start, probe_rgb)
+            args.screen_color = _detect_screen_color(probe_rgb, probe_alpha)
+            log.info("Auto-detected screen color: %s", args.screen_color)
+
+    from CorridorKeyModule.core.color_utils import screen_channel_for_color
+    screen_channel = screen_channel_for_color(args.screen_color)
+
     engine = _create_engine(
         device=args.device, screen_color=args.screen_color,
         image_size=args.image_size, backend=args.backend,
@@ -910,6 +953,8 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
                     despeckle_size=args.despeckle_size,
                     refiner_scale=args.refiner_scale,
                     input_is_linear=args.input_is_linear,
+                    post_process_on_gpu=args.gpu_post_processing,
+                    screen_channel=screen_channel,
                 )
                 rgba_u8 = _pack_rgba_u8(result["fg"], result["alpha"].squeeze(-1))
                 if keyed_path is not None:
@@ -973,10 +1018,14 @@ def main() -> None:
                         help="Torch device: cuda, mps, or cpu (default: auto-detect)")
     common.add_argument("--backend", default=None, choices=("auto", "torch", "mlx"),
                         help="Inference backend (default: auto-detect). MLX = Apple Silicon only.")
-    common.add_argument("--screen-color", default="green", choices=("green", "blue"),
-                        help="Screen color to key against (default: green)")
-    common.add_argument("--despill-strength", type=float, default=1.0,
-                        help="Despill strength 0.0-1.0 (default: 1.0). 1.0 = full despill.")
+    common.add_argument("--screen-color", default="auto",
+                        choices=("auto", "green", "blue"),
+                        help="Screen color to key against (default: auto). 'auto' probes "
+                             "the first frame + its alpha hint and picks green vs blue "
+                             "(matches the wizard's default).")
+    common.add_argument("--despill-strength", type=float, default=0.5,
+                        help="Despill strength 0.0-1.0 (default: 0.5, matches the wizard). "
+                             "1.0 = full despill, 0.0 = no despill.")
     common.add_argument("--despeckle-size", type=int, default=400,
                         help="Min connected-pixel area for alpha matte cleanup (default: 400)")
     common.add_argument("--no-despeckle", action="store_true",
@@ -987,6 +1036,11 @@ def main() -> None:
                         help="Inference image size used by the model (default: 2048)")
     common.add_argument("--input-is-linear", action="store_true",
                         help="Treat the input as linear (instead of sRGB)")
+    common.add_argument("--gpu-post-processing", action="store_true",
+                        help="Run resize / despeckle / despill / composite on the GPU "
+                             "(torch path) instead of CPU (opencv/numpy). Default: off, "
+                             "matching the wizard. The CPU path uses Lanczos4 for the "
+                             "final resize, which is sharper at high output resolutions.")
 
     # --- Alpha hint generation ------------------------------------------------
     hint = parser.add_argument_group("alpha hint")
