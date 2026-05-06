@@ -289,6 +289,137 @@ def _write_cached_alphahint(path: Path, alpha_f32: np.ndarray) -> None:
     cv2.imwrite(str(path), (np.clip(alpha_f32, 0, 1) * 255).astype(np.uint8))
 
 
+# --- VideoMaMa (mask-hint refinement) ----------------------------------------
+
+def _read_mask_hint_frames(mask_hint_path: Path) -> list[np.ndarray]:
+    """Load a coarse mask hint as a list of binary-thresholded uint8 frames.
+
+    Mirrors the wizard's behaviour in ``clip_manager.run_videomama``: accepts
+    either a directory of mask images (PNG/JPG/EXR) or a video file, force-
+    thresholds to binary at the same level (>10).
+    """
+    frames: list[np.ndarray] = []
+    if mask_hint_path.is_dir():
+        files = sorted(
+            f for f in mask_hint_path.iterdir()
+            if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".exr")
+        )
+        for f in files:
+            if f.suffix.lower() == ".exr":
+                m = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+                if m is None:
+                    continue
+                if m.ndim == 3:
+                    m = m[:, :, 0]
+                m = (np.clip(m, 0.0, 1.0) * 255.0).astype(np.uint8)
+            else:
+                m = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE)
+                if m is None:
+                    continue
+            _, m = cv2.threshold(m, 10, 255, cv2.THRESH_BINARY)
+            frames.append(m)
+    elif mask_hint_path.is_file():
+        cap = cv2.VideoCapture(str(mask_hint_path))
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                m = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                _, m = cv2.threshold(m, 10, 255, cv2.THRESH_BINARY)
+                frames.append(m)
+        finally:
+            cap.release()
+    else:
+        raise FileNotFoundError(f"--mask-hint not found: {mask_hint_path}")
+    return frames
+
+
+def _generate_videomama_masks(
+    input_path: Path,
+    mask_hint_path: Path,
+    output_dir: Path,
+    input_stem: str,
+    device: str,
+    chunk_size: int,
+) -> list[Path]:
+    """Run VideoMaMa on (input video, coarse mask hint) → per-frame refined
+    alpha masks in ``output_dir`` as ``<input_stem>_NNNNNN.png``.
+
+    Mirrors the wizard's ``run_videomama`` (clip_manager.py) — same model
+    loading pattern, same binary-threshold pre-processing on the mask hint,
+    same chunked iteration.  Drops the pipeline from VRAM before returning.
+
+    NOTE: VideoMaMa requires every input frame and mask frame to be loaded
+    into RAM at once (the inference module's API takes lists, not a stream),
+    so peak host memory is ~``n_frames * (img + mask)``.
+    """
+    # The VideoMaMaInferenceModule uses intra-package imports that assume its
+    # own directory is on sys.path (mirrors clip_manager.run_videomama).
+    sys.path.append(str(_project_root / "VideoMaMaInferenceModule"))
+    from VideoMaMaInferenceModule.inference import (  # noqa: E402
+        load_videomama_model,
+        run_inference as run_videomama_frames,
+    )
+
+    log.info("Loading VideoMaMa pipeline on %s ...", device)
+    pipeline = load_videomama_model(device=device)
+
+    log.info("Reading input frames from %s ...", input_path)
+    cap = cv2.VideoCapture(str(input_path))
+    input_frames: list[np.ndarray] = []
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            input_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    finally:
+        cap.release()
+    log.info("Loaded %d input frames", len(input_frames))
+
+    log.info("Reading mask hint from %s ...", mask_hint_path)
+    mask_frames = _read_mask_hint_frames(mask_hint_path)
+    log.info("Loaded %d mask frames", len(mask_frames))
+
+    n = min(len(input_frames), len(mask_frames))
+    if n == 0:
+        raise RuntimeError("VideoMaMa: no valid (input, mask) pairs to process.")
+    if len(input_frames) != len(mask_frames):
+        log.warning(
+            "VideoMaMa: input has %d frames, mask hint has %d — using %d.",
+            len(input_frames), len(mask_frames), n,
+        )
+    input_frames = input_frames[:n]
+    mask_frames = mask_frames[:n]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log.info("Running VideoMaMa (chunk_size=%d) over %d frames ...", chunk_size, n)
+    written: list[Path] = []
+    saved = 0
+    for chunk in run_videomama_frames(pipeline, input_frames, mask_frames, chunk_size=chunk_size):
+        for frame_rgb in chunk:
+            if saved >= n:
+                break
+            # VideoMaMa returns the matte as a 3-channel RGB image (channels
+            # are equal — it's a grayscale matte broadcast).  Take a single
+            # channel to match BiRefNet/GVM's grayscale cache convention.
+            gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+            dst = output_dir / _frame_filename(input_stem, saved)
+            cv2.imwrite(str(dst), gray, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+            written.append(dst)
+            saved += 1
+        log.info("VideoMaMa: %d/%d frames written", saved, n)
+
+    del pipeline
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    log.info("VideoMaMa wrote %d masks → %s", len(written), output_dir)
+    return written
+
+
 # --- GVM (Generative Video Matting) ------------------------------------------
 
 def _generate_gvm_masks(
@@ -519,25 +650,41 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
     # video; if ANY mask is missing we regenerate them all (this input's files
     # only — other inputs in the shared cache are left intact).  For BiRefNet,
     # alpha generation is per-frame so partial caches are fine.
-    if args.alpha_method == "gvm":
+    if args.alpha_method in ("gvm", "videomama"):
+
+        def _clear_stale_for_input() -> None:
+            if alpha_dir is None or not alpha_dir.is_dir():
+                return
+            stale = list(alpha_dir.glob(f"{input_stem}_*.png"))
+            if stale:
+                log.info(
+                    "%s cache for %r incomplete; clearing %d stale files",
+                    args.alpha_method.upper(), input_stem, len(stale),
+                )
+                for f in stale:
+                    f.unlink()
+
+        def _run_alpha_gen(target_dir: Path) -> None:
+            if args.alpha_method == "gvm":
+                _generate_gvm_masks(input_path, target_dir, input_stem, args.device)
+            else:  # videomama
+                _generate_videomama_masks(
+                    input_path,
+                    Path(args.mask_hint),
+                    target_dir,
+                    input_stem,
+                    args.device,
+                    args.videomama_chunk_size,
+                )
+
         if alpha_dir is not None and not _all_present(alpha_dir, input_stem, 0, n_total):
-            if alpha_dir.is_dir():
-                # Partial GVM output is unsafe — clear THIS input's masks and
-                # regenerate.  Other inputs sharing the dir are untouched.
-                stale = list(alpha_dir.glob(f"{input_stem}_*.png"))
-                if stale:
-                    log.info(
-                        "GVM cache for %r incomplete; clearing %d stale files",
-                        input_stem, len(stale),
-                    )
-                    for f in stale:
-                        f.unlink()
-            _generate_gvm_masks(input_path, alpha_dir, input_stem, args.device)
+            _clear_stale_for_input()
+            _run_alpha_gen(alpha_dir)
         elif alpha_dir is None:
             # Caching disabled: write masks to a tempdir for this run only.
             tmp_holder = tempfile.TemporaryDirectory(prefix="corridorkey_alpha_")
             alpha_dir = Path(tmp_holder.name)
-            _generate_gvm_masks(input_path, alpha_dir, input_stem, args.device)
+            _run_alpha_gen(alpha_dir)
             args._tmp_alpha_holder = tmp_holder  # keep alive until end of run
 
     # BiRefNet handler is created lazily on the first uncached alpha hint.
@@ -548,10 +695,10 @@ def run_video(input_path: Path, output_path: Path, args: argparse.Namespace) -> 
         cached = _frame_path(alpha_dir, input_stem, idx)
         if cached and cached.is_file():
             return _read_cached_alphahint(cached)
-        if args.alpha_method == "gvm":
+        if args.alpha_method in ("gvm", "videomama"):
             raise RuntimeError(
-                f"GVM mask missing for frame {idx} of {input_stem!r} after "
-                f"generation pass — check cache dir {alpha_dir}"
+                f"{args.alpha_method.upper()} mask missing for frame {idx} of "
+                f"{input_stem!r} after generation pass — check cache dir {alpha_dir}"
             )
         if handler is None:
             handler = _create_birefnet(args.device, args.birefnet_usage)
@@ -679,15 +826,27 @@ def main() -> None:
 
     # --- Alpha hint generation ------------------------------------------------
     hint = parser.add_argument_group("alpha hint")
-    hint.add_argument("--alpha-method", default="birefnet", choices=("birefnet", "gvm"),
+    hint.add_argument("--alpha-method", default="birefnet",
+                      choices=("birefnet", "gvm", "videomama"),
                       help="Alpha hint generator for video input (default: birefnet). "
-                           "'gvm' runs the auto-matte path used by the wizard's `g` action: "
-                           "GVMProcessor generates per-frame masks for the whole clip first, "
-                           "then the CorridorKey engine streams inference + WebM encoding.")
+                           "'birefnet' is per-frame segmentation. "
+                           "'gvm' runs the auto-matte path (wizard's `g` action): GVM "
+                           "generates per-frame masks for the whole clip, then the CK "
+                           "engine streams inference + encoding. "
+                           "'videomama' refines a coarse mask hint provided via "
+                           "--mask-hint (wizard's `v` action).")
     hint.add_argument("--birefnet-usage", default="Matting", metavar="USAGE",
                       help="BiRefNet model variant (default: Matting). See BiRefNetModule docs.")
     hint.add_argument("--alpha-hint", default=None,
                       help="Image-only: path to a pre-computed alpha hint PNG (bypasses BiRefNet)")
+    hint.add_argument("--mask-hint", default=None, metavar="PATH",
+                      help="VideoMaMa-only: coarse mask hint to refine. Either a directory "
+                           "of mask images (PNG/JPG/EXR, one per frame, sorted) or a video "
+                           "file. Required when --alpha-method=videomama; force-thresholded "
+                           "to binary before VideoMaMa inference.")
+    hint.add_argument("--videomama-chunk-size", type=int, default=50, metavar="N",
+                      help="VideoMaMa-only: number of frames per inference chunk "
+                           "(default: 50, matches the wizard).")
 
     # --- Video-only options ---------------------------------------------------
     video = parser.add_argument_group("video output (.webm)")
@@ -728,6 +887,14 @@ def main() -> None:
 
     if args.no_despeckle:
         args.despeckle_size = 0
+
+    if args.alpha_method == "videomama":
+        if args.mask_hint is None:
+            sys.exit("--alpha-method videomama requires --mask-hint <video-or-dir>")
+        if not Path(args.mask_hint).exists():
+            sys.exit(f"--mask-hint not found: {args.mask_hint}")
+    elif args.mask_hint is not None:
+        log.warning("--mask-hint is only used with --alpha-method=videomama; ignoring.")
 
     args.device = resolve_device(args.device)
     log.info("Using device: %s", args.device)
