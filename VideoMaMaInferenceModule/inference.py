@@ -23,16 +23,20 @@ if current_dir not in sys.path:
 
 from .pipeline import VideoInferencePipeline
 
-def load_videomama_model(base_model_path: Optional[str] = None, unet_checkpoint_path: Optional[str] = None, device: str = "cpu") -> VideoInferencePipeline:
+def load_videomama_model(base_model_path: Optional[str] = None, unet_checkpoint_path: Optional[str] = None, device: str = "cpu", low_vram: bool = False) -> VideoInferencePipeline:
     """
     Load VideoMaMa pipeline with pretrained weights.
 
     Args:
-        base_model_path (str, optional): Path to the base Stable Video Diffusion model. 
+        base_model_path (str, optional): Path to the base Stable Video Diffusion model.
                                          Defaults to 'checkpoints/stable-video-diffusion-img2vid-xt' in module dir.
         unet_checkpoint_path (str, optional): Path to the fine-tuned UNet checkpoint.
                                               Defaults to 'checkpoints/VideoMaMa' in module dir.
         device (str): Device to run on ("cuda" or "cpu").
+        low_vram (bool): When True, models stay on CPU at construction and migrate
+                         to ``device`` lazily inside :meth:`run` (one resident at
+                         a time).  Required on cards that can't fit
+                         image_encoder + VAE + UNet at once (~7 GiB).
 
     Returns:
         VideoInferencePipeline: Loaded pipeline instance.
@@ -40,13 +44,13 @@ def load_videomama_model(base_model_path: Optional[str] = None, unet_checkpoint_
     # Default to local checkpoints if not provided
     if base_model_path is None:
         base_model_path = os.path.join(current_dir, "checkpoints", "stable-video-diffusion-img2vid-xt")
-    
+
     if unet_checkpoint_path is None:
         unet_checkpoint_path = os.path.join(current_dir, "checkpoints", "VideoMaMa")
 
     print(f"Loading Base model from {base_model_path}...")
     print(f"Loading VideoMaMa UNet from {unet_checkpoint_path}...")
-    
+
     # Check if paths exist
     if not os.path.exists(base_model_path):
         raise FileNotFoundError(f"Base model path not found: {base_model_path}")
@@ -57,9 +61,10 @@ def load_videomama_model(base_model_path: Optional[str] = None, unet_checkpoint_
         base_model_path=base_model_path,
         unet_checkpoint_path=unet_checkpoint_path,
         weight_dtype=torch.float16, # Use float16 for inference by default
-        device=device
+        device=device,
+        low_vram=low_vram,
     )
-    
+
     print("VideoMaMa pipeline loaded successfully!")
     return pipeline
 

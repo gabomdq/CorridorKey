@@ -844,7 +844,7 @@ class VideoInferencePipeline:
     """
 
     def __init__(self, base_model_path: str, unet_checkpoint_path: str, device: str = "cuda",
-                 weight_dtype: torch.dtype = torch.float16):
+                 weight_dtype: torch.dtype = torch.float16, low_vram: bool = False):
         """
         Loads all necessary models into memory.
 
@@ -853,10 +853,19 @@ class VideoInferencePipeline:
             unet_checkpoint_path (str): Path to the fine-tuned UNet checkpoint.
             device (str): The device to run models on ('cuda' or 'cpu').
             weight_dtype (torch.dtype): The precision for model weights (float16 or bfloat16).
+            low_vram (bool): When True, models stay on CPU at __init__ and migrate
+                             to ``execution_device`` lazily inside :meth:`run` —
+                             one resident at a time.  Required on cards that
+                             can't fit IE + VAE + UNet (~7 GiB) at once.
         """
         logger.info("--- Initializing Inference Pipeline and Loading Models ---")
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        # execution_device is where forward passes run; self.device is the same
+        # but in low_vram mode the modules themselves stay on CPU until run()
+        # migrates them.
+        self.execution_device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.device = self.execution_device  # back-compat: callers expect .device
         self.weight_dtype = weight_dtype
+        self.low_vram = low_vram
 
         # Load models from pretrained paths
         try:
@@ -869,14 +878,38 @@ class VideoInferencePipeline:
         except Exception as e:
             raise IOError(f"Fatal error loading models: {e}")
 
-        # Move models to the specified device and set to evaluation mode
-        # CLIP must run in FP32 to avoid CUBLAS errors
-        self.image_encoder.to(self.device, dtype=torch.float32).eval()
-        # VAE must also run in FP32 to avoid CUBLAS errors
-        self.vae.to(self.device, dtype=torch.float32).eval()
-        self.unet.to(self.device, dtype=self.weight_dtype).eval()
+        # In low_vram mode, only cast dtypes — leave the modules on CPU.  run()
+        # will move them to execution_device one at a time.
+        load_device = torch.device("cpu") if low_vram else self.execution_device
 
-        logger.info("--- Models Loaded Successfully on %s ---", self.device)
+        # CLIP must run in FP32 to avoid CUBLAS errors
+        self.image_encoder.to(load_device, dtype=torch.float32).eval()
+        # VAE must also run in FP32 to avoid CUBLAS errors
+        self.vae.to(load_device, dtype=torch.float32).eval()
+        self.unet.to(load_device, dtype=self.weight_dtype).eval()
+
+        logger.info(
+            "--- Models Loaded Successfully on %s (low_vram=%s) ---",
+            load_device, low_vram,
+        )
+
+    def _to_exec(self, *modules):
+        """Migrate modules to execution_device (no-op outside low_vram)."""
+        if not self.low_vram:
+            return
+        for m in modules:
+            m.to(self.execution_device)
+        if self.execution_device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def _to_cpu(self, *modules):
+        """Push modules back to CPU (no-op outside low_vram)."""
+        if not self.low_vram:
+            return
+        for m in modules:
+            m.to("cpu")
+        if self.execution_device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def run(self, cond_frames, mask_frames, seed=42, mask_cond_mode="vae", fps=7, motion_bucket_id=127,
             noise_aug_strength=0.0):
@@ -904,24 +937,27 @@ class VideoInferencePipeline:
 
         with torch.no_grad():
             # --- 2. Get CLIP Image Embeddings ---
+            self._to_exec(self.image_encoder)
             first_frame_tensor = cond_video_tensor[:, 0, :, :, :]
             pixel_values_for_clip = self._resize_with_antialiasing(first_frame_tensor, (224, 224))
             pixel_values_for_clip = ((pixel_values_for_clip + 1.0) / 2.0).clamp(0, 1)
             pixel_values = self.feature_extractor(images=pixel_values_for_clip, do_rescale=False, return_tensors="pt").pixel_values
             # Run CLIP in FP32
             image_embeddings = self.image_encoder(pixel_values.to(self.device, dtype=torch.float32)).image_embeds
-            
+            self._to_cpu(self.image_encoder)
+
             logger.debug("CLIP Embeds Max: %.4f, Mean: %.4f", image_embeddings.max().item(), image_embeddings.mean().item())
 
             # Setup for UNet which uses weight_dtype (likely FP16)
             image_embeddings = image_embeddings.to(dtype=self.weight_dtype)
             encoder_hidden_states = torch.zeros_like(image_embeddings).unsqueeze(1)
 
-            # --- 3. Prepare Latents ---
+            # --- 3. Prepare Latents (VAE encode) ---
+            self._to_exec(self.vae)
             # VAE encoding must happen in FP32
             cond_video_tensor_fp32 = cond_video_tensor.to(dtype=torch.float32)
             cond_latents = self._tensor_to_vae_latent(cond_video_tensor_fp32)
-            
+
             logger.debug("Cond Latents Max: %.4f, Mean: %.4f", cond_latents.max().item(), cond_latents.mean().item())
 
             # Cast back to weight_dtype (FP16) for UNet
@@ -943,8 +979,10 @@ class VideoInferencePipeline:
                 mask_latents = rearrange(interpolated_mask, "(b t) c h w -> b t c h w", b=b)
             else:
                 raise ValueError(f"Unknown mask_cond_mode: {mask_cond_mode}")
+            self._to_cpu(self.vae)
 
             # --- 4. Run UNet Single-Step Inference ---
+            self._to_exec(self.unet)
             generator = torch.Generator(device=self.device).manual_seed(seed)
             noisy_latents = torch.randn(cond_latents.shape, generator=generator, device=self.device,
                                         dtype=self.weight_dtype)
@@ -953,10 +991,12 @@ class VideoInferencePipeline:
 
             unet_input = torch.cat([noisy_latents, cond_latents, mask_latents], dim=2)
             pred_latents = self.unet(unet_input, timesteps, encoder_hidden_states, added_time_ids=added_time_ids).sample
-            
+            self._to_cpu(self.unet)
+
             logger.debug("Pred Latents Max: %.4f, Mean: %.4f", pred_latents.max().item(), pred_latents.mean().item())
 
             # --- 5. Decode Latents to Video Frames ---
+            self._to_exec(self.vae)
             pred_latents = (1 / self.vae.config.scaling_factor) * pred_latents.squeeze(0)
 
             frames = []
@@ -967,6 +1007,7 @@ class VideoInferencePipeline:
                 chunk = pred_latents_fp32[i: i + 8]
                 decoded_chunk = self.vae.decode(chunk, num_frames=chunk.shape[0]).sample
                 frames.append(decoded_chunk)
+            self._to_cpu(self.vae)
 
             video_tensor = torch.cat(frames, dim=0)
             logger.debug("Video Tensor (Pre-Clamp) Max: %.4f, Mean: %.4f", video_tensor.max().item(), video_tensor.mean().item())

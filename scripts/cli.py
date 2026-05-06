@@ -516,9 +516,24 @@ def _generate_videomama_masks(
         run_inference as run_videomama_frames,
     )
 
+    # Auto-enable low-VRAM mode below 12 GiB so the constructor doesn't OOM
+    # while moving image_encoder + VAE + UNet to GPU at the same time.  The
+    # flag tells VideoInferencePipeline to keep modules on CPU at __init__
+    # and migrate them to the execution device one at a time inside run().
+    low_vram = False
+    if device.startswith("cuda") and torch.cuda.is_available():
+        total_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if total_gib < 12.0:
+            low_vram = True
+            log.info(
+                "VideoMaMa low-VRAM mode (%.1f GiB total): models stay on "
+                "CPU at construction; run() migrates one module at a time.",
+                total_gib,
+            )
+
     log.info("Loading VideoMaMa pipeline on %s ...", device)
     try:
-        pipeline = load_videomama_model(device=device)
+        pipeline = load_videomama_model(device=device, low_vram=low_vram)
     except FileNotFoundError as e:
         sys.exit(
             f"VideoMaMa weights are not installed: {e}\n"
@@ -528,59 +543,6 @@ def _generate_videomama_masks(
             f"Or use --alpha-method=birefnet (no extra weights needed) or "
             f"--alpha-method=gvm if those weights are already present."
         )
-
-    # Low-VRAM mode: auto-enable sequential CPU offload on cards under 12 GiB.
-    # SVD's image_encoder + VAE + UNet together are ~7 GiB resident; with
-    # latents during inference this won't fit on an 8 GiB card.  We chain
-    # accelerate's cpu_offload_with_hook so each module migrates to GPU on
-    # forward and the previous model migrates back to CPU.  We also monkey-
-    # patch vae.decode so the UNet (which the chain alone leaves resident
-    # during the final decode) goes back to CPU before decode runs — same
-    # pattern as the 2f88d97 GVM patch.  Peak VRAM ≈ largest single model
-    # (~5 GiB UNet) instead of the full sum.
-    if device.startswith("cuda") and torch.cuda.is_available():
-        total_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        if total_gib < 12.0:
-            try:
-                from accelerate import cpu_offload_with_hook
-            except ImportError:
-                log.warning(
-                    "accelerate not available — skipping low-VRAM offload. "
-                    "VideoMaMa may OOM on cards <12 GiB.",
-                )
-            else:
-                log.info(
-                    "VideoMaMa low-VRAM mode (%.1f GiB total): chaining CPU "
-                    "offload on image_encoder → vae → unet + offloading "
-                    "unet before vae.decode.",
-                    total_gib,
-                )
-                exec_device = pipeline.device
-                _, ie_hook = cpu_offload_with_hook(
-                    pipeline.image_encoder, exec_device,
-                )
-                _, vae_hook = cpu_offload_with_hook(
-                    pipeline.vae, exec_device, prev_module_hook=ie_hook,
-                )
-                _, unet_hook = cpu_offload_with_hook(
-                    pipeline.unet, exec_device, prev_module_hook=vae_hook,
-                )
-
-                # Monkey-patch vae.decode so the UNet goes to CPU just before
-                # the final decode loop.  Without this, the chain above leaves
-                # UNet resident through decode (peak = VAE + UNet + latents).
-                _vae = pipeline.vae
-                _unet = pipeline.unet
-                _orig_decode = _vae.decode
-
-                def _decode_with_unet_offload(*a, **kw):
-                    if next(_unet.parameters()).device.type == "cuda":
-                        _unet.to("cpu")
-                        torch.cuda.empty_cache()
-                    return _orig_decode(*a, **kw)
-
-                _vae.decode = _decode_with_unet_offload
-                torch.cuda.empty_cache()
 
     log.info("Reading input frames from %s ...", input_path)
     cap = cv2.VideoCapture(str(input_path))
